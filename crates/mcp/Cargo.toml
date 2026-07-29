@@ -1,0 +1,17 @@
+[package]
+name = "agentodo-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server exposing agentodo to agents."
+
+[[bin]]
+name = "agentodo-mcp"
+path = "src/main.rs"
+
+[dependencies]
+agentodo-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
