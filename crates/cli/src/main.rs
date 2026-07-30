@@ -286,3 +286,16 @@ fn priority_label(p: Priority) -> &'static str {
         Priority::High => "high",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches duplicate short/long flags, bad defaults and conflicting groups,
+    /// which clap otherwise only reports by panicking at runtime.
+    #[test]
+    fn cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+}
