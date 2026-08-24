@@ -10,7 +10,7 @@ mod store;
 
 pub use error::{Error, Result};
 pub use filter::{Filter, SortBy};
-pub use model::{NewTodo, Priority, Status, Todo, TodoPatch};
+pub use model::{NewTodo, Priority, ProjectSummary, Status, Todo, TodoPatch};
 pub use store::Store;
 
 #[cfg(test)]
@@ -162,5 +162,94 @@ mod tests {
         assert_eq!(next, 3);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn projects_lists_distinct_names_alphabetically_with_unassigned_last() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        sample(&mut store); // home, work
+        store.add(NewTodo {
+            title: "no project".into(),
+            ..Default::default()
+        });
+        store.add(NewTodo {
+            title: "another home task".into(),
+            project: Some("home".into()),
+            ..Default::default()
+        });
+
+        let projects = store.projects();
+        let names: Vec<Option<&str>> = projects.iter().map(|p| p.project.as_deref()).collect();
+        assert_eq!(names, vec![Some("home"), Some("work"), None]);
+        assert_eq!(projects[0].open, 2);
+        assert_eq!(projects[2].open, 1);
+    }
+
+    #[test]
+    fn projects_splits_open_and_done_counts() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let a = store.add(NewTodo {
+            title: "shipped".into(),
+            project: Some("work".into()),
+            ..Default::default()
+        });
+        store.add(NewTodo {
+            title: "still going".into(),
+            project: Some("work".into()),
+            ..Default::default()
+        });
+        store.set_status(a.id, Status::Done).unwrap();
+
+        let projects = store.projects();
+        assert_eq!(projects[0].project.as_deref(), Some("work"));
+        assert_eq!((projects[0].open, projects[0].done), (1, 1));
+    }
+
+    #[test]
+    fn projects_is_empty_for_an_empty_store() {
+        let store = Store::load("/nonexistent/ignored.json").unwrap();
+        assert!(store.projects().is_empty());
+    }
+
+    #[test]
+    fn projects_reports_unassigned_even_when_every_todo_has_a_project() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        sample(&mut store);
+
+        let projects = store.projects();
+        let last = projects.last().unwrap();
+        assert_eq!(last.project, None);
+        assert_eq!((last.open, last.done), (0, 0));
+    }
+
+    #[test]
+    fn projects_folds_an_empty_project_string_into_unassigned() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        store.add(NewTodo {
+            title: "hand-edited".into(),
+            project: Some(String::new()),
+            ..Default::default()
+        });
+
+        let projects = store.projects();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project, None);
+        assert_eq!(projects[0].open, 1);
+    }
+
+    #[test]
+    fn projects_are_case_sensitive_so_typos_stay_visible() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        for name in ["work", "Work"] {
+            store.add(NewTodo {
+                title: name.into(),
+                project: Some(name.into()),
+                ..Default::default()
+            });
+        }
+
+        let projects = store.projects();
+        let names: Vec<Option<&str>> = projects.iter().map(|p| p.project.as_deref()).collect();
+        assert_eq!(names, vec![Some("Work"), Some("work"), None]);
     }
 }

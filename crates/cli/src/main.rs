@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use agentodo_core::{Filter, NewTodo, Priority, SortBy, Status, Store, Todo, TodoPatch};
+use agentodo_core::{
+    Filter, NewTodo, Priority, ProjectSummary, SortBy, Status, Store, Todo, TodoPatch,
+};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -36,6 +38,8 @@ enum Command {
     Edit(EditArgs),
     /// Remove a todo.
     Rm { id: u64 },
+    /// List distinct projects with todo counts.
+    Projects,
 }
 
 #[derive(Debug, Args)]
@@ -195,6 +199,9 @@ fn main() -> Result<()> {
                 println!("removed #{} {}", todo.id, todo.title);
             }
         }
+        Command::Projects => {
+            print_projects(&store.projects(), cli.json)?;
+        }
     }
     Ok(())
 }
@@ -252,6 +259,39 @@ fn print_list(todos: &[Todo], json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn print_projects(projects: &[ProjectSummary], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(projects)?);
+        return Ok(());
+    }
+    if projects.is_empty() {
+        println!("No projects yet.");
+        return Ok(());
+    }
+    // Named projects render as @name to match print_list; the unassigned
+    // bucket is (none). Width tracks the longest label so names never wrap.
+    let labels: Vec<String> = projects.iter().map(project_label).collect();
+    let width = labels.iter().map(String::len).max().unwrap_or(0).max(7);
+    println!("{:<width$}  OPEN  DONE", "PROJECT", width = width);
+    for (p, label) in projects.iter().zip(&labels) {
+        println!(
+            "{:<width$}  {:>4}  {:>4}",
+            label,
+            p.open,
+            p.done,
+            width = width
+        );
+    }
+    Ok(())
+}
+
+fn project_label(p: &ProjectSummary) -> String {
+    match &p.project {
+        Some(name) => format!("@{name}"),
+        None => "(none)".to_string(),
+    }
 }
 
 fn print_detail(t: &Todo) {

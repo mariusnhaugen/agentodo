@@ -43,15 +43,18 @@ agentodo undone 1
 agentodo edit 2 --priority high --add-tag blocked --project ""   # "" clears project
 agentodo rm 2
 
+agentodo projects            # distinct projects with open/done counts
+
 agentodo list --json         # machine-readable output (global flag)
 ```
 
 ## MCP server
 
 `agentodo-mcp` speaks the MCP stdio transport (newline-delimited JSON-RPC 2.0) and
-exposes six tools, each mapping to one core operation:
+exposes seven tools, each mapping to one core operation:
 
-`add_todo`, `list_todos`, `get_todo`, `complete_todo`, `update_todo`, `delete_todo`.
+`add_todo`, `list_todos`, `get_todo`, `complete_todo`, `update_todo`, `delete_todo`,
+`list_projects`.
 
 Register it with an MCP client. For Claude Code / Claude Desktop, add to the
 `mcpServers` block:

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::filter::Filter;
-use crate::model::{NewTodo, Status, Todo, TodoPatch};
+use crate::model::{NewTodo, ProjectSummary, Status, Todo, TodoPatch};
 
 /// The on-disk representation of the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +120,46 @@ impl Store {
             .collect();
         filter.sort(&mut result);
         result
+    }
+
+    /// Distinct projects with open/done counts, alphabetical, unassigned last.
+    ///
+    /// Todos with no project (or an empty one, which only a hand-edited file
+    /// can produce) are folded into a single trailing `None` bucket. Matching
+    /// is case-sensitive, so `Work` and `work` are reported separately — that
+    /// is what makes an accidental duplicate visible.
+    pub fn projects(&self) -> Vec<ProjectSummary> {
+        if self.data.todos.is_empty() {
+            return Vec::new();
+        }
+
+        let mut counts: BTreeMap<Option<&str>, (usize, usize)> = BTreeMap::new();
+        for todo in &self.data.todos {
+            let key = todo.project.as_deref().filter(|p| !p.is_empty());
+            let entry = counts.entry(key).or_default();
+            match todo.status {
+                Status::Open => entry.0 += 1,
+                Status::Done => entry.1 += 1,
+            }
+        }
+
+        // `None` sorts first under `Option`'s ordering, but it belongs last.
+        let unassigned = counts.remove(&None);
+        let mut summaries: Vec<ProjectSummary> = counts
+            .into_iter()
+            .map(|(project, (open, done))| ProjectSummary {
+                project: project.map(str::to_owned),
+                open,
+                done,
+            })
+            .collect();
+        let (open, done) = unassigned.unwrap_or_default();
+        summaries.push(ProjectSummary {
+            project: None,
+            open,
+            done,
+        });
+        summaries
     }
 
     /// Looks up a todo by id.

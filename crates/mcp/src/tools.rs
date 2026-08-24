@@ -122,6 +122,14 @@ pub fn definitions() -> Value {
                 "properties": { "id": { "type": "integer" } },
                 "required": ["id"]
             }
+        },
+        {
+            "name": "list_projects",
+            "description": "List distinct projects with open/done todo counts. Unassigned todos are reported as a null project.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -135,6 +143,7 @@ pub fn call(name: &str, args: &Value) -> ToolResult {
         "complete_todo" => complete_todo(args),
         "update_todo" => update_todo(args),
         "delete_todo" => delete_todo(args),
+        "list_projects" => list_projects(args),
         other => Err(format!("unknown tool: {other}")),
     };
     match result {
@@ -218,6 +227,11 @@ fn list_todos(args: &Value) -> Result<Value, String> {
     Ok(json!(store.list(&filter)))
 }
 
+fn list_projects(_args: &Value) -> Result<Value, String> {
+    let store = load()?;
+    Ok(json!(store.projects()))
+}
+
 fn get_todo(args: &Value) -> Result<Value, String> {
     let id = require_id(args)?;
     let store = load()?;
@@ -260,4 +274,35 @@ fn delete_todo(args: &Value) -> Result<Value, String> {
     let todo = store.delete(id).map_err(|e| e.to_string())?;
     store.save().map_err(|e| e.to_string())?;
     Ok(json!(todo))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `definitions()` and `call()` are a hand-rolled two-place registry, so a
+    /// tool can be advertised to clients yet never dispatched. Empty arguments
+    /// make the mutating tools fail on their missing `required` field long
+    /// before they reach `save()`, so nothing is written.
+    #[test]
+    fn every_declared_tool_is_dispatched() {
+        // Sole test in this crate, so setting a process-global env var is safe.
+        // If a second one is added, serialize them behind a shared fixture.
+        std::env::set_var(
+            "AGENTODO_STORE",
+            std::env::temp_dir().join("agentodo-wiring-test.json"),
+        );
+
+        let definitions = definitions();
+        let tools = definitions.as_array().expect("definitions is an array");
+        assert!(!tools.is_empty());
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool has a name");
+            let result = call(name, &json!({}));
+            assert!(
+                !result.text.starts_with("unknown tool:"),
+                "{name} is declared but not dispatched"
+            );
+        }
+    }
 }

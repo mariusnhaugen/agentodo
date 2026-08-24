@@ -65,3 +65,15 @@ pub struct TodoPatch {
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
 }
+
+/// Aggregate todo counts for one project.
+///
+/// `project` is `None` for todos with no project set; unlike [`Todo::project`]
+/// it is always serialized, so consumers see the unassigned bucket as an
+/// explicit `null` rather than a missing key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub project: Option<String>,
+    pub open: usize,
+    pub done: usize,
+}
