@@ -1,8 +1,8 @@
 # agentodo
 
-A small todo tracker you can drive from the command line and expose to an agent
-over MCP. The todo logic lives in one core library; the CLI and the MCP server
-are thin adapters over it.
+A small todo tracker you can drive from the command line or a vim-style TUI, and
+expose to an agent over MCP. The todo logic lives in one core library; the CLI,
+TUI and MCP server are thin adapters over it.
 
 ## Layout
 
@@ -11,13 +11,14 @@ crates/
   core/   agentodo-core — domain model + JSON storage (all the real logic)
   cli/    agentodo      — command-line interface
   mcp/    agentodo-mcp  — MCP server (stdio) exposing todos to an agent
+  tui/    agentodo-tui  — vim-style terminal UI
 ```
 
 ## Storage
 
 Todos live in a single JSON file. Resolution order:
 
-1. `--store <path>` (CLI only)
+1. `--store <path>` (CLI and TUI)
 2. `$AGENTODO_STORE`
 3. platform default (`~/.local/share/agentodo/todos.json` on Linux)
 
@@ -48,6 +49,31 @@ agentodo projects            # distinct projects with open/done counts
 agentodo list --json         # machine-readable output (global flag)
 ```
 
+## TUI
+
+```sh
+agentodo-tui                 # or: agentodo-tui --store <path>
+```
+
+A flat list with the current line highlighted, driven by vim keys. Press `?` in
+the app for the full list.
+
+| Keys | Action |
+|---|---|
+| `j` `k` (with counts), `gg` `G`, `C-d` `C-u` | move |
+| `o` `O` | add below / above — `title !h +project #tag` |
+| `i`, `cc` | edit / retype title |
+| `dd`, `3dd` | delete |
+| `x`, `+` `-`, `gp`, `e` | toggle done, priority, project, notes in `$EDITOR` |
+| `u`, `C-r` | undo / redo (deleted todos come back with the same id) |
+| `/` `n` `N` | search titles |
+| `p`, `.`, `s` | project filter, show/hide done, toggle sort |
+| `:q` `:project [name]` `:sort priority\|created` | commands |
+
+Every change is written immediately (reload → edit → save), and the store file is
+polled every second, so todos an agent adds over MCP appear while you watch
+without either side overwriting the other.
+
 ## MCP server
 
 `agentodo-mcp` speaks the MCP stdio transport (newline-delimited JSON-RPC 2.0) and
@@ -72,13 +98,13 @@ Register it with an MCP client. For Claude Code / Claude Desktop, add to the
 }
 ```
 
-The CLI and the MCP server share the same store file, so todos you add on the
-command line are visible to the agent and vice versa.
+The CLI, TUI and MCP server share the same store file, so todos you add on the
+command line or in the TUI are visible to the agent and vice versa.
 
 ## Development
 
 ```sh
-cargo test --workspace      # core has unit tests for CRUD, filtering, round-trip
+cargo test --workspace      # core CRUD/parsing tests, TUI keymap + render tests
 cargo clippy --workspace
 ```
 

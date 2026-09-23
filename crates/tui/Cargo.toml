@@ -1,0 +1,17 @@
+[package]
+name = "agentodo-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vim-flavoured terminal UI for agentodo."
+
+[[bin]]
+name = "agentodo-tui"
+path = "src/main.rs"
+
+[dependencies]
+agentodo-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ratatui = "0.30"
