@@ -5,12 +5,14 @@
 
 mod error;
 mod filter;
+mod log;
 mod model;
 mod parse;
 mod store;
 
 pub use error::{Error, Result};
 pub use filter::{Filter, SortBy};
+pub use log::{log_path, read_log, read_log_from, Actor, EntryKind, FieldChange, LogEntry, Source};
 pub use model::{NewTodo, Priority, ProjectSummary, Status, Todo, TodoPatch};
 pub use parse::{parse_quick_add, QuickAdd};
 pub use store::Store;
@@ -311,5 +313,139 @@ mod tests {
     fn resolve_path_prefers_explicit_flag() {
         let p = Store::resolve_path(Some("/explicit.json".into())).unwrap();
         assert_eq!(p, std::path::PathBuf::from("/explicit.json"));
+    }
+
+    fn temp_store_path(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agentodo-log-{}-{}", name, std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("todos.json")
+    }
+
+    #[test]
+    fn every_mutation_is_logged_with_snapshots_and_actor() {
+        let path = temp_store_path("mutations");
+        let mut store = Store::load(&path).unwrap();
+        store.set_actor(Actor {
+            source: Source::Mcp,
+            client: Some("claude-code".into()),
+        });
+
+        let t = store.add(NewTodo {
+            title: "task".into(),
+            ..Default::default()
+        });
+        store.set_status(t.id, Status::Done).unwrap();
+        store
+            .update(
+                t.id,
+                TodoPatch {
+                    title: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let removed = store.delete(t.id).unwrap();
+        store.restore(removed.clone()).unwrap();
+        store.replace(t.clone()).unwrap();
+        store.save().unwrap();
+
+        let log = read_log(&store.log_path()).unwrap();
+        let ops: Vec<&str> = log.iter().map(|e| e.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            [
+                "add",
+                "set_status",
+                "update",
+                "delete",
+                "restore",
+                "replace"
+            ]
+        );
+        assert!(log.iter().all(|e| e.id == t.id));
+        assert!(log
+            .iter()
+            .all(|e| e.actor.client.as_deref() == Some("claude-code")));
+
+        assert_eq!(log[0].kind(), EntryKind::Created);
+        assert_eq!(log[0].after.as_ref(), Some(&t));
+        assert_eq!(log[3].kind(), EntryKind::Deleted);
+        assert_eq!(log[3].before.as_ref(), Some(&removed));
+        assert_eq!(log[5].after.as_ref(), Some(&t));
+
+        let diff = log[1].diff();
+        assert_eq!(diff.len(), 1);
+        assert_eq!(
+            (diff[0].field, diff[0].old.as_str(), diff[0].new.as_str()),
+            ("status", "open", "done")
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn save_appends_once_and_skips_no_op_updates() {
+        let path = temp_store_path("append");
+        let mut store = Store::load(&path).unwrap();
+        let t = store.add(NewTodo::default());
+        store.save().unwrap();
+        store.save().unwrap(); // nothing pending: nothing appended
+
+        store.update(t.id, TodoPatch::default()).unwrap();
+        store.save().unwrap();
+
+        let mut reloaded = Store::load(&path).unwrap();
+        reloaded.delete(t.id).unwrap();
+        reloaded.save().unwrap();
+
+        let log = read_log(&store.log_path()).unwrap();
+        let ops: Vec<&str> = log.iter().map(|e| e.op.as_str()).collect();
+        assert_eq!(ops, ["add", "delete"]);
+        assert_eq!(log[0].actor.source, Source::Unknown);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_log_tails_from_offset_and_skips_garbage() {
+        let path = temp_store_path("tail");
+        let log = log_path(&path);
+        assert!(read_log(&log).unwrap().is_empty(), "missing log is empty");
+
+        let mut store = Store::load(&path).unwrap();
+        store.add(NewTodo::default());
+        store.save().unwrap();
+        let (first, offset) = read_log_from(&log, 0).unwrap();
+        assert_eq!(first.len(), 1);
+
+        // Garbage and a half-written line must not break or be consumed.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        f.write_all(b"not json\n{\"partial").unwrap();
+        drop(f);
+        store.add(NewTodo::default());
+
+        let (next, offset2) = read_log_from(&log, offset).unwrap();
+        assert!(next.is_empty());
+        let len = std::fs::metadata(&log).unwrap().len();
+        assert_eq!(offset2, len - "{\"partial".len() as u64);
+
+        // A log shorter than the offset is re-read from the start.
+        std::fs::write(&log, "").unwrap();
+        store.save().unwrap();
+        let (again, _) = read_log_from(&log, offset2).unwrap();
+        assert_eq!(again.len(), 1);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn log_path_sits_next_to_the_store() {
+        assert_eq!(
+            log_path(std::path::Path::new("/data/todos.json")),
+            std::path::PathBuf::from("/data/todos.log.jsonl")
+        );
     }
 }

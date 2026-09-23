@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::filter::Filter;
+use crate::log::{self, Actor, LogEntry};
 use crate::model::{NewTodo, ProjectSummary, Status, Todo, TodoPatch};
 
 /// The on-disk representation of the store.
@@ -31,17 +32,22 @@ impl Default for StoreData {
 /// Mutations happen in memory; call [`Store::save`] to persist them. Saving is
 /// atomic — data is written to a temp file and renamed over the target, so an
 /// interrupted write cannot corrupt an existing store.
+///
+/// Every mutation is also recorded as a [`LogEntry`] attributed to the store's
+/// [`Actor`], and appended to the change log (see [`log::log_path`]) by `save`.
 #[derive(Debug, Clone)]
 pub struct Store {
     path: PathBuf,
     data: StoreData,
+    actor: Actor,
+    /// Log entries for mutations not yet saved.
+    pending: Vec<LogEntry>,
 }
 
 impl Store {
     /// Resolves the default store path: `<data_dir>/agentodo/todos.json`.
     pub fn default_path() -> Result<PathBuf> {
-        let dirs =
-            directories::ProjectDirs::from("", "", "agentodo").ok_or(Error::NoDataDir)?;
+        let dirs = directories::ProjectDirs::from("", "", "agentodo").ok_or(Error::NoDataDir)?;
         Ok(dirs.data_dir().join("todos.json"))
     }
 
@@ -74,7 +80,12 @@ impl Store {
                 })
             }
         };
-        Ok(Store { path, data })
+        Ok(Store {
+            path,
+            data,
+            actor: Actor::default(),
+            pending: Vec::new(),
+        })
     }
 
     /// The path this store reads from and writes to.
@@ -82,8 +93,42 @@ impl Store {
         &self.path
     }
 
-    /// Persists the store to disk atomically.
-    pub fn save(&self) -> Result<()> {
+    /// Attributes subsequent mutations to `actor` in the change log.
+    pub fn set_actor(&mut self, actor: Actor) {
+        self.actor = actor;
+    }
+
+    /// The change log belonging to this store.
+    pub fn log_path(&self) -> PathBuf {
+        log::log_path(&self.path)
+    }
+
+    fn record(&mut self, op: &str, id: u64, before: Option<Todo>, after: Option<Todo>) {
+        // `updated_at` alone moving isn't a change worth logging.
+        if let (Some(b), Some(a)) = (&before, &after) {
+            let unchanged = Todo {
+                updated_at: a.updated_at,
+                ..b.clone()
+            } == *a;
+            if unchanged {
+                return;
+            }
+        }
+        self.pending.push(LogEntry {
+            at: Utc::now(),
+            actor: self.actor.clone(),
+            op: op.to_owned(),
+            id,
+            before,
+            after,
+        });
+    }
+
+    /// Persists the store to disk atomically, then appends the change log.
+    ///
+    /// The log is written after the store, so an interrupted save can lose a
+    /// log line but never log a change that didn't happen.
+    pub fn save(&mut self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|source| Error::Io {
@@ -113,7 +158,28 @@ impl Store {
         fs::rename(&tmp, &self.path).map_err(|source| Error::Io {
             path: self.path.clone(),
             source,
-        })
+        })?;
+
+        self.append_log()
+    }
+
+    fn append_log(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut lines = String::new();
+        for entry in self.pending.drain(..) {
+            lines.push_str(&serde_json::to_string(&entry).map_err(Error::Serialize)?);
+            lines.push('\n');
+        }
+        let path = self.log_path();
+        // One append-mode write per save keeps concurrent writers' lines whole.
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(lines.as_bytes()))
+            .map_err(|source| Error::Io { path, source })
     }
 
     /// All todos in insertion order (unsorted, unfiltered).
@@ -198,6 +264,7 @@ impl Store {
             completed_at: None,
         };
         self.data.todos.push(todo.clone());
+        self.record("add", id, None, Some(todo.clone()));
         todo
     }
 
@@ -209,6 +276,7 @@ impl Store {
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or(Error::NotFound(id))?;
+        let before = todo.clone();
 
         if let Some(title) = patch.title {
             todo.title = title;
@@ -231,7 +299,9 @@ impl Store {
             }
         }
         todo.updated_at = Utc::now();
-        Ok(todo.clone())
+        let after = todo.clone();
+        self.record("update", id, Some(before), Some(after.clone()));
+        Ok(after)
     }
 
     /// Sets a todo's status, maintaining `completed_at`.
@@ -243,6 +313,7 @@ impl Store {
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or(Error::NotFound(id))?;
+        let before = todo.clone();
 
         todo.status = status;
         todo.completed_at = match status {
@@ -250,7 +321,9 @@ impl Store {
             Status::Open => None,
         };
         todo.updated_at = now;
-        Ok(todo.clone())
+        let after = todo.clone();
+        self.record("set_status", id, Some(before), Some(after.clone()));
+        Ok(after)
     }
 
     /// Removes a todo by id, returning it.
@@ -261,7 +334,9 @@ impl Store {
             .iter()
             .position(|t| t.id == id)
             .ok_or(Error::NotFound(id))?;
-        Ok(self.data.todos.remove(pos))
+        let todo = self.data.todos.remove(pos);
+        self.record("delete", id, Some(todo.clone()), None);
+        Ok(todo)
     }
 
     /// Re-inserts a previously removed todo verbatim, keeping its id and
@@ -272,6 +347,7 @@ impl Store {
         }
         self.data.next_id = self.data.next_id.max(todo.id + 1);
         self.data.todos.push(todo.clone());
+        self.record("restore", todo.id, None, Some(todo.clone()));
         Ok(todo)
     }
 
@@ -284,7 +360,8 @@ impl Store {
             .iter_mut()
             .find(|t| t.id == todo.id)
             .ok_or(Error::NotFound(todo.id))?;
-        *slot = todo.clone();
+        let before = std::mem::replace(slot, todo.clone());
+        self.record("replace", todo.id, Some(before), Some(todo.clone()));
         Ok(todo)
     }
 }

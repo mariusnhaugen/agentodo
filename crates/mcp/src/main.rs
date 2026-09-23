@@ -41,6 +41,9 @@ fn main() -> io::Result<()> {
 
         match (method, id) {
             ("initialize", Some(id)) => {
+                if let Some(name) = params.pointer("/clientInfo/name").and_then(Value::as_str) {
+                    tools::set_client_name(name);
+                }
                 write_message(&mut stdout, &success(id, initialize_result()))?;
             }
             ("tools/list", Some(id)) => {

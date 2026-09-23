@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use agentodo_core::Store;
+use agentodo_core::{Actor, Source, Store};
 use anyhow::{Context, Result};
 
 /// What we remember about the store file to notice writes from elsewhere
@@ -49,6 +49,7 @@ impl Repo {
         f: impl FnOnce(&mut Store) -> agentodo_core::Result<T>,
     ) -> Result<T> {
         let mut store = Store::load(&self.path)?;
+        store.set_actor(Actor::from_env(Source::Tui));
         let out = f(&mut store)?;
         store.save()?;
         Ok(out)

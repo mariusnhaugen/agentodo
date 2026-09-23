@@ -2,7 +2,9 @@
 //! store, calls one core function, saves, and returns the affected todo(s) as
 //! JSON text.
 
-use agentodo_core::{Filter, NewTodo, Priority, SortBy, Status, Store, TodoPatch};
+use std::sync::OnceLock;
+
+use agentodo_core::{Actor, Filter, NewTodo, Priority, SortBy, Source, Status, Store, TodoPatch};
 use serde_json::{json, Value};
 
 /// The result of invoking a tool: text to return to the caller, and whether it
@@ -28,9 +30,23 @@ impl ToolResult {
     }
 }
 
+/// The connected client's `clientInfo.name`, captured at `initialize`.
+static CLIENT_NAME: OnceLock<String> = OnceLock::new();
+
+/// Records which MCP client is connected so its changes are attributed to it
+/// in the change log. Only the first call counts.
+pub fn set_client_name(name: &str) {
+    CLIENT_NAME.set(name.to_owned()).ok();
+}
+
 fn load() -> Result<Store, String> {
     let path = Store::resolve_path(None).map_err(|e| e.to_string())?;
-    Store::load(&path).map_err(|e| e.to_string())
+    let mut store = Store::load(&path).map_err(|e| e.to_string())?;
+    // `$AGENTODO_ACTOR` wins over what the client calls itself.
+    let mut actor = Actor::from_env(Source::Mcp);
+    actor.client = actor.client.or_else(|| CLIENT_NAME.get().cloned());
+    store.set_actor(actor);
+    Ok(store)
 }
 
 /// The list of tools advertised to the client, with JSON Schema for inputs.

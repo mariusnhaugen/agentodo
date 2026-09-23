@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use agentodo_core::{
-    Filter, NewTodo, Priority, ProjectSummary, SortBy, Status, Store, Todo, TodoPatch,
+    Actor, Filter, NewTodo, Priority, ProjectSummary, SortBy, Source, Status, Store, Todo,
+    TodoPatch,
 };
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -131,10 +132,10 @@ impl From<SortArg> for SortBy {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path =
-        Store::resolve_path(cli.store.clone()).context("determining default store path")?;
-    let mut store = Store::load(&path)
-        .with_context(|| format!("loading store at {}", path.display()))?;
+    let path = Store::resolve_path(cli.store.clone()).context("determining default store path")?;
+    let mut store =
+        Store::load(&path).with_context(|| format!("loading store at {}", path.display()))?;
+    store.set_actor(Actor::from_env(Source::Cli));
 
     match cli.command {
         Command::Add(args) => {
