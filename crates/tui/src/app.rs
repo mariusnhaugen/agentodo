@@ -384,15 +384,7 @@ impl App {
             KeyCode::Char('n') => self.search_step(true),
             KeyCode::Char('N') => self.search_step(false),
             KeyCode::Char('p') => self.open_picker(),
-            KeyCode::Char('.') => {
-                self.show_done = !self.show_done;
-                self.rebuild_rows();
-                self.info(if self.show_done {
-                    "showing done"
-                } else {
-                    "hiding done"
-                });
-            }
+            KeyCode::Char('.') => self.set_show_done(!self.show_done),
             KeyCode::Char('s') => {
                 self.sort = match self.sort {
                     SortBy::Priority => SortBy::Created,
@@ -556,6 +548,12 @@ impl App {
         }
     }
 
+    fn set_show_done(&mut self, show: bool) {
+        self.show_done = show;
+        self.rebuild_rows();
+        self.info(if show { "showing done" } else { "hiding done" });
+    }
+
     fn set_project_filter(&mut self, filter: ProjectFilter) {
         self.project = filter;
         self.rebuild_rows();
@@ -572,6 +570,8 @@ impl App {
             "q" | "q!" | "quit" | "wq" | "x" => return Effect::Quit,
             "w" => self.info("every change is saved as you make it"),
             "h" | "help" => self.mode = Mode::Help,
+            "hide" => self.set_show_done(false),
+            "show" => self.set_show_done(true),
             "project" | "proj" => self.set_project_filter(if arg.is_empty() {
                 ProjectFilter::All
             } else {
@@ -1103,6 +1103,21 @@ pub(crate) mod tests {
         assert_eq!(titles(&app), ["low"]);
         press(&mut app, ".");
         assert_eq!(titles(&app), ["low", "high"]);
+    }
+
+    #[test]
+    fn hide_and_show_commands_set_done_visibility() {
+        let ts = TempStore::new();
+        ts.seed(&["open", "finished"]);
+        let mut app = ts.app();
+        press(&mut app, "/fin<CR>x");
+
+        press(&mut app, ":hide<CR>");
+        assert_eq!(titles(&app), ["open"]);
+        press(&mut app, ":hide<CR>"); // idempotent, unlike `.`
+        assert_eq!(titles(&app), ["open"]);
+        press(&mut app, ":show<CR>");
+        assert_eq!(titles(&app), ["open", "finished"]);
     }
 
     #[test]

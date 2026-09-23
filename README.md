@@ -68,7 +68,7 @@ the app for the full list.
 | `u`, `C-r` | undo / redo (deleted todos come back with the same id) |
 | `/` `n` `N` | search titles |
 | `p`, `.`, `s` | project filter, show/hide done, toggle sort |
-| `:q` `:project [name]` `:sort priority\|created` | commands |
+| `:q` `:project [name]` `:sort priority\|created` `:hide` `:show` | commands |
 
 Every change is written immediately (reload → edit → save), and the store file is
 polled every second, so todos an agent adds over MCP appear while you watch

@@ -330,7 +330,7 @@ const HELP: &[(&str, &str)] = &[
     ("u  C-r", "undo / redo"),
     ("/  n N", "search titles / next / previous"),
     ("p", "filter by project"),
-    (".", "show / hide done"),
+    (".", "show / hide done (also :show / :hide)"),
     ("s", "toggle sort: priority / created"),
     ("Enter", "details"),
     (":", ":q  :project [name]  :sort priority|created"),
