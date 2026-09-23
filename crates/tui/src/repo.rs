@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use agentodo_core::{Actor, Source, Store};
@@ -25,6 +25,10 @@ impl Repo {
             path: path.into(),
             seen: None,
         }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Loads the current store and remembers its fingerprint.

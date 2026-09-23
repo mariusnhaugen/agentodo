@@ -13,5 +13,6 @@ path = "src/main.rs"
 [dependencies]
 agentodo-core.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 ratatui = "0.30"

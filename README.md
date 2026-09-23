@@ -69,10 +69,25 @@ the app for the full list.
 | `/` `n` `N` | search titles |
 | `p`, `.`, `s` | project filter, show/hide done, toggle sort |
 | `:q` `:project [name]` `:sort priority\|created` `:hide` `:show` | commands |
+| `]c` `[c`, `:log`, `:seen` | jump between changed todos, change log, clear markers |
 
 Every change is written immediately (reload → edit → save), and the store file is
 polled every second, so todos an agent adds over MCP appear while you watch
 without either side overwriting the other.
+
+## Change log
+
+Every change made through the CLI, TUI or MCP server is appended to
+`todos.log.jsonl` next to the store: one JSON line with a timestamp, who made it
+(`cli`, `tui` or `mcp`, plus the MCP client's name), the operation, and full
+before/after snapshots of the todo. Set `$AGENTODO_ACTOR` to label changes from
+a particular script or agent.
+
+In the TUI, todos changed by anyone else since your last session get a `•`
+marker (`]c`/`[c` jump between them; moving past one clears it). `:log` shows
+the history newest first: `Enter` jumps to the todo, `a` shows only others'
+changes, and `r` reverts an entry, as long as the todo hasn't changed since.
+A revert is an ordinary change, so `u` undoes it.
 
 ## MCP server
 

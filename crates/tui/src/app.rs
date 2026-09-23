@@ -4,10 +4,14 @@
 //! only effects that need the terminal (quitting, suspending for `$EDITOR`)
 //! are returned to the caller as an [`Effect`].
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+
 use agentodo_core::{
-    parse_quick_add, Filter, NewTodo, Priority, ProjectSummary, SortBy, Status, Store, Todo,
-    TodoPatch,
+    log_path, parse_quick_add, read_log, read_log_from, EntryKind, Filter, LogEntry, NewTodo,
+    Priority, ProjectSummary, SortBy, Source, Status, Store, Todo, TodoPatch,
 };
+use chrono::{DateTime, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
@@ -36,6 +40,13 @@ pub enum Mode {
     Picker {
         items: Vec<ProjectFilter>,
         selected: usize,
+    },
+    /// `:log`. `entries` is `all` (newest first), narrowed when `others_only`.
+    Log {
+        all: Vec<LogEntry>,
+        entries: Vec<LogEntry>,
+        selected: usize,
+        others_only: bool,
     },
     Help,
     Detail,
@@ -162,10 +173,20 @@ pub struct App {
     /// Height of the list viewport, set by the renderer, for `Ctrl-d`/`Ctrl-u`.
     pub page: usize,
     pub table: TableState,
+    log_path: PathBuf,
+    /// How far into the change log we've read.
+    log_offset: u64,
+    /// Changes by others after this instant get a marker.
+    seen: DateTime<Utc>,
+    /// Todos changed by someone else since `seen` that you haven't moved past.
+    pub changed: HashSet<u64>,
 }
 
 impl App {
-    pub fn new(repo: Repo) -> anyhow::Result<Self> {
+    /// `seen` is when the previous TUI session ended; changes by others after
+    /// it are marked. `None` (first run) marks only changes from now on.
+    pub fn new(repo: Repo, seen: Option<DateTime<Utc>>) -> anyhow::Result<Self> {
+        let log_path = log_path(repo.path());
         let mut app = App {
             repo,
             all: Vec::new(),
@@ -184,6 +205,10 @@ impl App {
             redo: Vec::new(),
             page: 20,
             table: TableState::default(),
+            log_path,
+            log_offset: 0,
+            seen: seen.unwrap_or_else(Utc::now),
+            changed: HashSet::new(),
         };
         let store = app.repo.load()?;
         app.absorb(store);
@@ -221,7 +246,27 @@ impl App {
     fn absorb(&mut self, store: Store) {
         self.projects = store.projects();
         self.all = store.all().to_vec();
+        self.read_new_log_entries();
         self.rebuild_rows();
+    }
+
+    /// Marks todos touched by others in log entries we haven't read yet.
+    fn read_new_log_entries(&mut self) {
+        match read_log_from(&self.log_path, self.log_offset) {
+            Ok((entries, offset)) => {
+                self.log_offset = offset;
+                let theirs = entries
+                    .iter()
+                    .filter(|e| e.actor.source != Source::Tui && e.at > self.seen);
+                for entry in theirs {
+                    match entry.kind() {
+                        EntryKind::Deleted => self.changed.remove(&entry.id),
+                        _ => self.changed.insert(entry.id),
+                    };
+                }
+            }
+            Err(e) => self.error(format!("reading change log: {e}")),
+        }
     }
 
     fn rebuild_rows(&mut self) {
@@ -285,6 +330,10 @@ impl App {
                 self.picker_key(key);
                 Effect::None
             }
+            Mode::Log { .. } => {
+                self.log_key(key);
+                Effect::None
+            }
             Mode::Help | Mode::Detail => {
                 self.mode = Mode::Normal;
                 Effect::None
@@ -293,6 +342,16 @@ impl App {
     }
 
     fn normal_key(&mut self, key: KeyEvent) -> Effect {
+        let before = self.cursor_id;
+        let effect = self.normal_key_inner(key);
+        // Moving off a marked todo counts as having seen it.
+        if let Some(id) = before.filter(|_| self.cursor_id != before) {
+            self.changed.remove(&id);
+        }
+        effect
+    }
+
+    fn normal_key_inner(&mut self, key: KeyEvent) -> Effect {
         self.message = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -322,6 +381,14 @@ impl App {
                     Effect::None
                 }
                 ('Z', KeyCode::Char('Z')) => Effect::Quit,
+                (']', KeyCode::Char('c')) => {
+                    self.jump_to_change(true);
+                    Effect::None
+                }
+                ('[', KeyCode::Char('c')) => {
+                    self.jump_to_change(false);
+                    Effect::None
+                }
                 _ => Effect::None,
             };
         }
@@ -334,7 +401,7 @@ impl App {
                     Some(count.unwrap_or(0).saturating_mul(10).saturating_add(digit));
                 return Effect::None;
             }
-            KeyCode::Char(c @ ('d' | 'g' | 'c' | 'Z')) if !ctrl => {
+            KeyCode::Char(c @ ('d' | 'g' | 'c' | 'Z' | ']' | '[')) if !ctrl => {
                 self.pending.op = Some(c);
                 return Effect::None;
             }
@@ -501,6 +568,153 @@ impl App {
         Effect::None
     }
 
+    // ---- change log -----------------------------------------------------------
+
+    fn jump_to_change(&mut self, forward: bool) {
+        let marked = |i: &usize| self.changed.contains(&self.rows[*i].id);
+        let hit = if forward {
+            (self.cursor + 1..self.rows.len()).find(marked)
+        } else {
+            (0..self.cursor).rev().find(marked)
+        };
+        match hit {
+            Some(i) => self.select(i),
+            None if self.changed.is_empty() => self.info("no changes by others"),
+            None => self.info("no more changes in that direction"),
+        }
+    }
+
+    fn open_log(&mut self) {
+        match read_log(&self.log_path) {
+            Ok(mut all) => {
+                all.reverse();
+                self.mode = Mode::Log {
+                    entries: all.clone(),
+                    all,
+                    selected: 0,
+                    others_only: false,
+                };
+            }
+            Err(e) => self.error(format!("reading change log: {e}")),
+        }
+    }
+
+    /// Re-reads the log after a revert, keeping the selection on `keep`.
+    fn refresh_log(&mut self, keep: &LogEntry) {
+        let Mode::Log { others_only, .. } = self.mode else {
+            return;
+        };
+        let Ok(mut all) = read_log(&self.log_path) else {
+            return;
+        };
+        all.reverse();
+        let entries = log_filter(&all, others_only);
+        let selected = entries.iter().position(|e| e == keep).unwrap_or(0);
+        self.mode = Mode::Log {
+            all,
+            entries,
+            selected,
+            others_only,
+        };
+    }
+
+    fn log_key(&mut self, key: KeyEvent) {
+        self.message = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let half = (self.page / 2).max(1);
+        let Mode::Log {
+            all,
+            entries,
+            selected,
+            others_only,
+        } = &mut self.mode
+        else {
+            return;
+        };
+        let last = entries.len().saturating_sub(1);
+
+        match key.code {
+            KeyCode::Char('d') if ctrl => *selected = (*selected + half).min(last),
+            KeyCode::Char('u') if ctrl => *selected = selected.saturating_sub(half),
+            _ if ctrl => {}
+            KeyCode::Char('j') | KeyCode::Down => *selected = (*selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Char('g') => *selected = 0,
+            KeyCode::Char('G') => *selected = last,
+            KeyCode::Char('a') => {
+                *others_only = !*others_only;
+                *entries = log_filter(all, *others_only);
+                *selected = 0;
+            }
+            KeyCode::Enter => {
+                if let Some(id) = entries.get(*selected).map(|e| e.id) {
+                    self.mode = Mode::Normal;
+                    self.goto_todo(id);
+                }
+            }
+            KeyCode::Char('r') => {
+                if let Some(entry) = entries.get(*selected).cloned() {
+                    self.revert_entry(entry);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    /// Puts the cursor on `id`, widening the filters if they hide it.
+    fn goto_todo(&mut self, id: u64) {
+        self.reload();
+        let Some(todo) = self.all.iter().find(|t| t.id == id).cloned() else {
+            return self.error(format!("#{id} no longer exists"));
+        };
+        if !self.project.matches(&todo) {
+            self.project = ProjectFilter::All;
+        }
+        if todo.status == Status::Done {
+            self.show_done = true;
+        }
+        self.focus(id);
+    }
+
+    /// Undoes one logged change, but only if the todo is still exactly as that
+    /// change left it; otherwise a newer change would be silently lost.
+    fn revert_entry(&mut self, entry: LogEntry) {
+        let id = entry.id;
+        let result = self.repo.with_store(|s| {
+            let current = s.get(id).cloned();
+            let change = match (entry.kind(), current) {
+                (EntryKind::Created, Some(cur)) if unchanged_since(&cur, &entry) => {
+                    Some(Change::Deleted(s.delete(id)?))
+                }
+                (EntryKind::Updated, Some(cur)) if unchanged_since(&cur, &entry) => {
+                    let before = entry.before.clone().expect("updates have a before");
+                    s.replace(before.clone())?;
+                    Some(Change::Updated {
+                        before: cur,
+                        after: before,
+                    })
+                }
+                (EntryKind::Deleted, None) => {
+                    let todo = entry.before.clone().expect("deletes have a before");
+                    Some(Change::Created(s.restore(todo)?))
+                }
+                _ => None,
+            };
+            Ok(change)
+        });
+        match result {
+            Ok(Some(change)) => {
+                self.record(vec![change]);
+                self.info(format!("reverted #{id}"));
+            }
+            Ok(None) => self.error(format!("#{id} changed since — revert newer entries first")),
+            Err(e) => self.error(format!("{e:#}")),
+        }
+        self.reload();
+        self.refresh_log(&entry);
+    }
+
     fn picker_key(&mut self, key: KeyEvent) {
         let Mode::Picker { items, selected } = &mut self.mode else {
             return;
@@ -571,6 +785,11 @@ impl App {
             "w" => self.info("every change is saved as you make it"),
             "h" | "help" => self.mode = Mode::Help,
             "hide" => self.set_show_done(false),
+            "log" => self.open_log(),
+            "seen" => {
+                self.changed.clear();
+                self.info("change markers cleared");
+            }
             "show" => self.set_show_done(true),
             "project" | "proj" => self.set_project_filter(if arg.is_empty() {
                 ProjectFilter::All
@@ -822,6 +1041,24 @@ impl App {
     }
 }
 
+fn log_filter(all: &[LogEntry], others_only: bool) -> Vec<LogEntry> {
+    all.iter()
+        .filter(|e| !others_only || e.actor.source != Source::Tui)
+        .cloned()
+        .collect()
+}
+
+/// True if `current` still matches the state `entry` left it in, ignoring
+/// `updated_at` (an unlogged no-op edit can bump it).
+fn unchanged_since(current: &Todo, entry: &LogEntry) -> bool {
+    entry.after.as_ref().is_some_and(|after| {
+        Todo {
+            updated_at: current.updated_at,
+            ..after.clone()
+        } == *current
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -866,7 +1103,23 @@ pub(crate) mod tests {
         }
 
         pub fn app(&self) -> App {
-            App::new(Repo::new(self.path())).unwrap()
+            App::new(Repo::new(self.path()), None).unwrap()
+        }
+
+        /// An app whose previous session ended at `seen`.
+        pub fn app_seen(&self, seen: DateTime<Utc>) -> App {
+            App::new(Repo::new(self.path()), Some(seen)).unwrap()
+        }
+
+        /// Edits the store the way an agent over MCP would.
+        pub fn as_agent(&self, f: impl FnOnce(&mut Store)) {
+            let mut store = self.store();
+            store.set_actor(agentodo_core::Actor {
+                source: Source::Mcp,
+                client: Some("bot".into()),
+            });
+            f(&mut store);
+            store.save().unwrap();
         }
 
         pub fn store(&self) -> Store {
@@ -1118,6 +1371,209 @@ pub(crate) mod tests {
         assert_eq!(titles(&app), ["open"]);
         press(&mut app, ":show<CR>");
         assert_eq!(titles(&app), ["open", "finished"]);
+    }
+
+    fn marked_titles(app: &App) -> Vec<&str> {
+        app.rows
+            .iter()
+            .filter(|t| app.changed.contains(&t.id))
+            .map(|t| t.title.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn marks_other_actors_changes_since_last_session() {
+        let ts = TempStore::new();
+        ts.seed(&["old !h", "touched", "quiet !l"]);
+        let seen = Utc::now();
+        ts.as_agent(|s| {
+            s.set_status(2, Status::Done).unwrap();
+        });
+        let mut app = ts.app_seen(seen);
+        assert_eq!(marked_titles(&app), ["touched"], "seed predates seen");
+
+        // Our own edits never get a marker; live agent edits do.
+        press(&mut app, "x");
+        ts.as_agent(|s| {
+            s.add(NewTodo {
+                title: "new from agent".into(),
+                ..Default::default()
+            });
+        });
+        app.refresh_if_changed();
+        let mut marked = marked_titles(&app);
+        marked.sort();
+        assert_eq!(marked, ["new from agent", "touched"]);
+    }
+
+    #[test]
+    fn first_session_marks_only_live_changes() {
+        let ts = TempStore::new();
+        ts.as_agent(|s| {
+            s.add(NewTodo::default());
+        });
+        let mut app = ts.app();
+        assert!(app.changed.is_empty());
+        ts.as_agent(|s| {
+            s.add(NewTodo::default());
+        });
+        app.reload();
+        assert_eq!(app.changed.len(), 1);
+    }
+
+    #[test]
+    fn jump_between_changes_and_clear_on_leave() {
+        let ts = TempStore::new();
+        ts.seed(&["a", "b", "c", "d"]);
+        let seen = Utc::now();
+        ts.as_agent(|s| {
+            for id in [1, 3] {
+                s.update(
+                    id,
+                    TodoPatch {
+                        title: Some(format!("agent {id}")),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let mut app = ts.app_seen(seen);
+        app.sort = SortBy::Created;
+        app.rebuild_rows();
+        app.select(0);
+        assert_eq!(titles(&app), ["d", "agent 3", "b", "agent 1"]);
+
+        press(&mut app, "]c");
+        assert_eq!(current_title(&app), "agent 3");
+        press(&mut app, "]c");
+        assert_eq!(current_title(&app), "agent 1");
+        assert_eq!(marked_titles(&app), ["agent 1"], "left agent 3 behind");
+        press(&mut app, "]c");
+        assert!(app.message.is_some(), "nothing further down");
+        press(&mut app, ":seen<CR>");
+        assert!(app.changed.is_empty());
+    }
+
+    fn log_entries(app: &App) -> Vec<(String, u64)> {
+        let Mode::Log { entries, .. } = &app.mode else {
+            panic!("not in log mode")
+        };
+        entries.iter().map(|e| (e.op.clone(), e.id)).collect()
+    }
+
+    #[test]
+    fn log_lists_newest_first_and_filters_to_others() {
+        let ts = TempStore::new();
+        let mut app = ts.app();
+        press(&mut app, "omine<CR>");
+        ts.as_agent(|s| {
+            s.add(NewTodo {
+                title: "theirs".into(),
+                ..Default::default()
+            });
+        });
+
+        press(&mut app, ":log<CR>");
+        assert_eq!(log_entries(&app), [("add".into(), 2), ("add".into(), 1)]);
+        press(&mut app, "a");
+        assert_eq!(log_entries(&app), [("add".into(), 2)]);
+        press(&mut app, "q");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn log_enter_jumps_to_todo_widening_filters() {
+        let ts = TempStore::new();
+        ts.seed(&["here +a", "there +b"]);
+        let mut app = ts.app();
+        press(&mut app, ":project a<CR>");
+        press(&mut app, ":hide<CR>");
+        ts.as_agent(|s| {
+            s.set_status(2, Status::Done).unwrap();
+        });
+
+        press(&mut app, ":log<CR><CR>");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(current_title(&app), "there");
+        assert_eq!(app.project, ProjectFilter::All);
+        assert!(app.show_done);
+    }
+
+    #[test]
+    fn revert_restores_an_agent_delete_with_its_id_and_is_undoable() {
+        let ts = TempStore::new();
+        ts.seed(&["keep me"]);
+        let original = ts.store().get(1).unwrap().clone();
+        ts.as_agent(|s| {
+            s.delete(1).unwrap();
+        });
+        let mut app = ts.app();
+
+        press(&mut app, ":log<CR>r");
+        assert_eq!(ts.store().get(1), Some(&original));
+        assert!(matches!(app.mode, Mode::Log { .. }), "stays in the log");
+        // The revert itself is logged (as ours) and selection stays put.
+        assert_eq!(log_entries(&app)[0], ("restore".into(), 1));
+        let Mode::Log { selected, .. } = app.mode else {
+            unreachable!()
+        };
+        assert_eq!(selected, 1);
+
+        press(&mut app, "q");
+        press(&mut app, "u");
+        assert!(ts.store().get(1).is_none());
+    }
+
+    #[test]
+    fn revert_undoes_updates_and_creates() {
+        let ts = TempStore::new();
+        ts.seed(&["title"]);
+        ts.as_agent(|s| {
+            s.update(
+                1,
+                TodoPatch {
+                    title: Some("agent title".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            s.add(NewTodo {
+                title: "spam".into(),
+                ..Default::default()
+            });
+        });
+        let mut app = ts.app();
+
+        press(&mut app, ":log<CR>r"); // newest: the add
+        assert!(ts.store().get(2).is_none());
+        // Selection stayed on the add (our revert was logged above it), so
+        // the update is next.
+        press(&mut app, "jr");
+        assert_eq!(ts.store().get(1).unwrap().title, "title");
+    }
+
+    #[test]
+    fn revert_refuses_when_todo_changed_since() {
+        let ts = TempStore::new();
+        ts.seed(&["a"]);
+        ts.as_agent(|s| {
+            s.set_status(1, Status::Done).unwrap();
+            s.update(
+                1,
+                TodoPatch {
+                    title: Some("later".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        });
+        let mut app = ts.app();
+
+        press(&mut app, ":log<CR>jr"); // the older set_status entry
+        assert!(app.message.as_ref().unwrap().error);
+        let t = ts.store().get(1).unwrap().clone();
+        assert_eq!((t.title.as_str(), t.status), ("later", Status::Done));
     }
 
     #[test]

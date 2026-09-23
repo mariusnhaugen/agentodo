@@ -9,12 +9,13 @@ mod repo;
 mod ui;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use agentodo_core::Store;
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::execute;
@@ -41,12 +42,23 @@ const POLL: Duration = Duration::from_secs(1);
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = Store::resolve_path(cli.store).context("determining default store path")?;
-    let mut app = App::new(Repo::new(path))?;
+    let seen_path = path.with_extension("tui-seen");
+    let mut app = App::new(Repo::new(path), read_seen(&seen_path))?;
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app);
     ratatui::restore();
+    // Best effort: failing to record it only means markers repeat next time.
+    std::fs::write(&seen_path, Utc::now().to_rfc3339()).ok();
     result
+}
+
+/// When the previous session ended, from the `.tui-seen` file beside the
+/// store. Missing or unreadable means this is the first session.
+fn read_seen(path: &Path) -> Option<DateTime<Utc>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let at = DateTime::parse_from_rfc3339(text.trim()).ok()?;
+    Some(at.with_timezone(&Utc))
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {

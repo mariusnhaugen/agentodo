@@ -1,10 +1,11 @@
-use agentodo_core::{Priority, SortBy, Status, Todo};
+use agentodo_core::{EntryKind, LogEntry, Priority, SortBy, Source, Status, Todo};
+use chrono::Local;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph,
-    Row, Table, Wrap,
+    Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -21,8 +22,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    draw_header(frame, app, header);
-    draw_list(frame, app, list);
+    if let Mode::Log { .. } = app.mode {
+        draw_log_header(frame, app, header);
+        draw_log(frame, app, list);
+    } else {
+        draw_header(frame, app, header);
+        draw_list(frame, app, list);
+    }
     draw_footer(frame, app, footer);
 
     match &app.mode {
@@ -127,7 +133,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Some((id, line)) if id == t.id => input_line(line),
                 _ => title_line(t, search),
             };
-            todo_row(t, title)
+            todo_row(t, title, app.changed.contains(&t.id))
         })
         .collect();
 
@@ -136,6 +142,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             rows.insert(
                 at,
                 Row::new(vec![
+                    Cell::from(""),
                     Cell::from("+".green()),
                     Cell::from(Line::from("new").right_aligned()).style(DIM),
                     Cell::from(input_line(line)),
@@ -151,6 +158,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let table = Table::new(
         rows,
         [
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(id_width),
             Constraint::Fill(1),
@@ -168,7 +176,9 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut app.table);
 }
 
-fn todo_row<'a>(t: &'a Todo, title: Line<'a>) -> Row<'a> {
+/// One list row. `changed` marks a todo someone else touched since you last
+/// looked.
+fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool) -> Row<'a> {
     let done = t.status == Status::Done;
     let marker = if done {
         Span::raw("✓")
@@ -190,7 +200,13 @@ fn todo_row<'a>(t: &'a Todo, title: Line<'a>) -> Row<'a> {
         Span::raw(tags_text(t)).magenta()
     };
 
+    let change = if changed {
+        "•".cyan().bold()
+    } else {
+        Span::raw("")
+    };
     let row = Row::new(vec![
+        Cell::from(change),
         Cell::from(marker),
         Cell::from(Line::from(t.id.to_string()).right_aligned()).style(DIM),
         Cell::from(title),
@@ -274,6 +290,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let (label, color) = match &app.mode {
         Mode::Input { .. } => (" INSERT ", Color::Green),
         Mode::Picker { .. } => (" PROJECT ", Color::Cyan),
+        Mode::Log { .. } => (" LOG ", Color::Magenta),
         _ => (" NORMAL ", Color::Blue),
     };
     let mut spans = vec![
@@ -287,6 +304,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "Enter/Esc save · !h !m !l priority · +project · #tag",
             DIM,
         )),
+        (None, Mode::Log { .. }) => spans.push(Span::styled(
+            "j/k move · Enter go to todo · r revert · a others only · q back",
+            DIM,
+        )),
         (None, _) => spans.push(Span::styled(
             "j/k move · o add · dd delete · x done · u undo · p project · ? help",
             DIM,
@@ -298,6 +319,144 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     if !showcmd.is_empty() {
         frame.render_widget(Line::from(format!("{showcmd}  ")).right_aligned(), area);
     }
+}
+
+fn draw_log_header(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::Log {
+        entries,
+        others_only,
+        ..
+    } = &app.mode
+    else {
+        return;
+    };
+    let scope = if *others_only {
+        "others only"
+    } else {
+        "everyone"
+    };
+    let left = Line::from(vec![
+        " agentodo".bold(),
+        Span::styled(" — ", DIM),
+        "change log".magenta(),
+        Span::styled(format!(" · {scope}"), DIM),
+    ]);
+    let right = Line::from(format!(" [{} changes] ", entries.len())).right_aligned();
+    let [left_area, right_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(right.width() as u16),
+    ])
+    .areas(area);
+    frame.render_widget(left, left_area);
+    frame.render_widget(right, right_area);
+}
+
+fn draw_log(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::new()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(DIM);
+    app.page = block.inner(area).height as usize;
+    let Mode::Log {
+        entries, selected, ..
+    } = &app.mode
+    else {
+        return;
+    };
+
+    if entries.is_empty() {
+        let hint = Paragraph::new(Span::styled("No changes logged yet", DIM)).block(block);
+        frame.render_widget(hint, area);
+        return;
+    }
+
+    let actor_width = entries
+        .iter()
+        .map(|e| actor_label(e).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(20) as u16;
+    let id_width = entries
+        .iter()
+        .map(|e| e.id.to_string().len() + 1)
+        .max()
+        .unwrap_or(2) as u16;
+
+    let rows = entries.iter().map(|e| {
+        let kind = match e.kind() {
+            EntryKind::Created => "created".green(),
+            EntryKind::Updated => "updated".yellow(),
+            EntryKind::Deleted => "deleted".red(),
+        };
+        let actor = match e.actor.source {
+            Source::Tui => Span::styled(actor_label(e), DIM),
+            _ => Span::raw(actor_label(e)).cyan(),
+        };
+        Row::new(vec![
+            Cell::from(Span::styled(
+                e.at.with_timezone(&Local).format("%m-%d %H:%M").to_string(),
+                DIM,
+            )),
+            Cell::from(actor),
+            Cell::from(kind),
+            Cell::from(Line::from(format!("#{}", e.id)).right_aligned()).style(DIM),
+            Cell::from(e.title().to_owned()),
+            Cell::from(Span::styled(diff_text(e), DIM)),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(11),
+            Constraint::Length(actor_width),
+            Constraint::Length(7),
+            Constraint::Length(id_width),
+            Constraint::Fill(2),
+            Constraint::Fill(3),
+        ],
+    )
+    .block(block)
+    .column_spacing(1)
+    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+    .highlight_symbol("▶ ")
+    .highlight_spacing(HighlightSpacing::Always);
+    let mut state = TableState::default().with_selected(Some(*selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// `mcp:claude-code`, or just the source when there is no client name.
+fn actor_label(e: &LogEntry) -> String {
+    let source = match e.actor.source {
+        Source::Cli => "cli",
+        Source::Tui => "tui",
+        Source::Mcp => "mcp",
+        Source::Unknown => "?",
+    };
+    match &e.actor.client {
+        Some(client) => format!("{source}:{client}"),
+        None => source.to_owned(),
+    }
+}
+
+/// `status open→done, priority medium→high`; notes only say they changed.
+fn diff_text(e: &LogEntry) -> String {
+    e.diff()
+        .iter()
+        .map(|c| match c.field {
+            "notes" => "notes edited".to_owned(),
+            field => {
+                let show = |v: &str| {
+                    if v.is_empty() {
+                        "—".to_owned()
+                    } else {
+                        v.to_owned()
+                    }
+                };
+                format!("{field} {}→{}", show(&c.old), show(&c.new))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn popup(frame: &mut Frame, width: u16, height: u16, title: &str) -> Rect {
@@ -354,6 +513,9 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         (":project [p]", "filter; no name = all"),
         (":sort p|c", "sort priority / created"),
         (":hide :show", "hide / show done"),
+        ("]c [c", "next / prev changed (•)"),
+        (":log", "change log (r reverts)"),
+        (":seen", "clear • markers"),
         ("q", "quit"),
         ("?", "this help"),
     ],
@@ -540,7 +702,7 @@ mod tests {
         assert!(row_text(&buf, 0).contains("[2 open / 0 done]"));
 
         let ship = find_row(&buf, "ship release");
-        assert!(row_text(&buf, ship).starts_with("▶ ●   2 ship release"));
+        assert!(row_text(&buf, ship).starts_with("▶   ●   2 ship release"));
         assert!(row_text(&buf, ship).contains("work"));
         assert!(row_text(&buf, ship).contains("#urgent"));
         assert!(buf[(4, ship)].modifier.contains(Modifier::REVERSED));
@@ -621,6 +783,34 @@ mod tests {
         let buf = render(&mut app, 50, 40);
         assert!(find_row(&buf, "todo-specific") > find_row(&buf, "works as in vim"));
         find_row(&buf, "while typing a title");
+    }
+
+    #[test]
+    fn change_marker_and_log_view_render() {
+        let ts = TempStore::new();
+        ts.seed(&["mine"]);
+        let seen = chrono::Utc::now();
+        ts.as_agent(|s| {
+            let id = s.add(agentodo_core::NewTodo {
+                title: "from agent".into(),
+                ..Default::default()
+            });
+            s.set_status(id.id, agentodo_core::Status::Done).unwrap();
+        });
+        let mut app = ts.app_seen(seen);
+
+        let buf = render(&mut app, 70, 8);
+        let y = find_row(&buf, "from agent");
+        assert_eq!(buf[(2, y)].symbol(), "•");
+        assert_ne!(buf[(2, find_row(&buf, "mine"))].symbol(), "•");
+
+        press(&mut app, ":log<CR>");
+        let buf = render(&mut app, 100, 8);
+        assert!(row_text(&buf, 0).contains("change log"));
+        let y = find_row(&buf, "status open→done");
+        assert!(row_text(&buf, y).contains("mcp:bot"));
+        assert!(row_text(&buf, y).contains("updated"));
+        assert!(row_text(&buf, 7).contains("LOG"));
     }
 
     #[test]
