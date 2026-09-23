@@ -3,8 +3,8 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
-    Table, Wrap,
+    Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph,
+    Row, Table, Wrap,
 };
 use ratatui::Frame;
 
@@ -316,41 +316,115 @@ fn popup(frame: &mut Frame, width: u16, height: u16, title: &str) -> Rect {
     inner
 }
 
-const HELP: &[(&str, &str)] = &[
-    ("j k ↓ ↑", "move (takes a count: 5j)"),
-    ("gg G  5G", "top / bottom / row 5"),
-    ("C-d C-u", "half page down / up"),
-    ("o O", "add todo below / above"),
-    ("i  cc", "edit title / retype title"),
-    ("dd  3dd", "delete (count deletes several)"),
-    ("x", "toggle done"),
-    ("+ -", "raise / lower priority"),
-    ("gp", "set project"),
-    ("e", "edit notes in $EDITOR"),
-    ("u  C-r", "undo / redo"),
-    ("/  n N", "search titles / next / previous"),
-    ("p", "filter by project"),
-    (".", "show / hide done (also :show / :hide)"),
-    ("s", "toggle sort: priority / created"),
-    ("Enter", "details"),
-    (":", ":q  :project [name]  :sort priority|created"),
-    ("q  ZZ", "quit"),
-    ("", ""),
-    ("new todo", "title !h +project #tag"),
-];
+struct HelpSection {
+    title: &'static str,
+    note: &'static str,
+    keys: &'static [(&'static str, &'static str)],
+}
 
-fn draw_help(frame: &mut Frame) {
-    let inner = popup(frame, 62, HELP.len() as u16 + 2, "keys");
-    let lines: Vec<Line> = HELP
+const VIM_KEYS: HelpSection = HelpSection {
+    title: "vim",
+    note: "works as in vim",
+    keys: &[
+        ("j k ↓ ↑", "move (count: 5j)"),
+        ("gg G 5G", "top / bottom / row 5"),
+        ("C-d C-u", "half page down / up"),
+        ("o O", "add below / above"),
+        ("i  cc", "edit / retype title"),
+        ("dd 3dd", "delete (with count)"),
+        ("u  C-r", "undo / redo"),
+        ("/  n N", "search / next / prev"),
+        (":  :5", "command line / row 5"),
+        (":q  ZZ", "quit"),
+    ],
+};
+
+const AGENTODO_KEYS: HelpSection = HelpSection {
+    title: "agentodo",
+    note: "todo-specific",
+    keys: &[
+        ("x", "toggle done"),
+        ("+ -", "raise / lower priority"),
+        ("gp", "set project"),
+        ("e", "edit notes in $EDITOR"),
+        ("Enter", "show details"),
+        ("p", "filter by project"),
+        (".", "show / hide done"),
+        ("s", "sort priority / created"),
+        (":project [p]", "filter; no name = all"),
+        (":sort p|c", "sort priority / created"),
+        (":hide :show", "hide / show done"),
+        ("q", "quit"),
+        ("?", "this help"),
+    ],
+};
+
+const QUICK_ADD_KEYS: HelpSection = HelpSection {
+    title: "quick-add",
+    note: "while typing a title",
+    keys: &[
+        ("!h !m !l", "high / medium / low"),
+        ("+name", "set project"),
+        ("#name", "add a tag"),
+        ("Enter Esc", "save"),
+    ],
+};
+
+fn section_lines(section: &HelpSection) -> Vec<Line<'static>> {
+    let key_width = section
+        .keys
         .iter()
-        .map(|(keys, what)| {
-            Line::from(vec![
-                format!("  {keys:<10}").bold().yellow(),
-                Span::raw(*what),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(9);
+    let mut lines = vec![Line::from(vec![
+        section.title.bold().cyan(),
+        Span::styled(format!("  {}", section.note), DIM),
+    ])];
+    lines.extend(section.keys.iter().map(|(keys, what)| {
+        Line::from(vec![
+            format!(" {keys:<key_width$}  ").bold().yellow(),
+            Span::raw(*what),
+        ])
+    }));
+    lines
+}
+
+/// Vim keys (plus the quick-add syntax used with `o`) on the left and
+/// agentodo's own keys on the right, or stacked when the terminal is too
+/// narrow for both.
+fn draw_help(frame: &mut Frame) {
+    let mut vim = section_lines(&VIM_KEYS);
+    vim.push(Line::default());
+    vim.extend(section_lines(&QUICK_ADD_KEYS));
+    let ours = section_lines(&AGENTODO_KEYS);
+
+    let width = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 1;
+    let (left, right) = (width(&vim), width(&ours));
+    // Indent + left column, separator + space, right column, border.
+    let wide = 1 + left + 2 + right + 2;
+    let indent = Block::new().padding(Padding::left(1));
+
+    if frame.area().width >= wide {
+        let height = vim.len().max(ours.len()) as u16 + 2;
+        let inner = popup(frame, wide, height, "keys");
+        let [l, sep, r] = Layout::horizontal([
+            Constraint::Length(left + 1),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
+        frame.render_widget(Paragraph::new(vim).block(indent), l);
+        frame.render_widget(Block::new().borders(Borders::LEFT).border_style(DIM), sep);
+        frame.render_widget(Paragraph::new(ours), r);
+    } else {
+        let mut lines = vim;
+        lines.push(Line::default());
+        lines.extend(ours);
+        let inner = popup(frame, left.max(right) + 3, lines.len() as u16 + 2, "keys");
+        frame.render_widget(Paragraph::new(lines).block(indent), inner);
+    }
 }
 
 fn draw_detail(frame: &mut Frame, app: &App) {
@@ -529,14 +603,40 @@ mod tests {
         assert!(find_row(&buf, "press o to add one") > 0);
 
         press(&mut app, "?");
-        let buf = render(&mut app, 70, 26);
+        let buf = render(&mut app, 70, 40);
         find_row(&buf, " keys ");
         find_row(&buf, "toggle done");
     }
 
     #[test]
+    fn help_puts_vim_and_agentodo_keys_side_by_side_when_wide() {
+        let ts = TempStore::new();
+        let mut app = ts.app();
+        press(&mut app, "?");
+
+        let buf = render(&mut app, 100, 24);
+        let y = find_row(&buf, "works as in vim");
+        assert!(row_text(&buf, y).contains("todo-specific"));
+
+        let buf = render(&mut app, 50, 40);
+        assert!(find_row(&buf, "todo-specific") > find_row(&buf, "works as in vim"));
+        find_row(&buf, "while typing a title");
+    }
+
+    #[test]
     #[ignore = "prints a frame for eyeballing: cargo test -p agentodo-tui -- --ignored --nocapture"]
     fn print_frame() {
+        // Help overlay, wide and narrow.
+        let ts_help = TempStore::new();
+        let mut help = ts_help.app();
+        press(&mut help, "?");
+        for (w, h) in [(90, 20), (48, 36)] {
+            let buf = render(&mut help, w, h);
+            for y in 0..buf.area.height {
+                println!("{}", row_text(&buf, y));
+            }
+        }
+
         let ts = TempStore::new();
         ts.seed(&[
             "buy milk !l +home #errand",
