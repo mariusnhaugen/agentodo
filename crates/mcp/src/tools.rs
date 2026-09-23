@@ -2,8 +2,6 @@
 //! store, calls one core function, saves, and returns the affected todo(s) as
 //! JSON text.
 
-use std::path::PathBuf;
-
 use agentodo_core::{Filter, NewTodo, Priority, SortBy, Status, Store, TodoPatch};
 use serde_json::{json, Value};
 
@@ -30,16 +28,8 @@ impl ToolResult {
     }
 }
 
-/// Store path precedence: `$AGENTODO_STORE`, then the platform default.
-fn store_path() -> Result<PathBuf, String> {
-    if let Some(p) = std::env::var_os("AGENTODO_STORE") {
-        return Ok(PathBuf::from(p));
-    }
-    Store::default_path().map_err(|e| e.to_string())
-}
-
 fn load() -> Result<Store, String> {
-    let path = store_path()?;
+    let path = Store::resolve_path(None).map_err(|e| e.to_string())?;
     Store::load(&path).map_err(|e| e.to_string())
 }
 

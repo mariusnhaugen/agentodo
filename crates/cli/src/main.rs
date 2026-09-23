@@ -131,7 +131,8 @@ impl From<SortArg> for SortBy {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let path = resolve_store_path(cli.store.clone())?;
+    let path =
+        Store::resolve_path(cli.store.clone()).context("determining default store path")?;
     let mut store = Store::load(&path)
         .with_context(|| format!("loading store at {}", path.display()))?;
 
@@ -204,17 +205,6 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Store path precedence: `--store` flag, then `$AGENTODO_STORE`, then default.
-fn resolve_store_path(flag: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(p) = flag {
-        return Ok(p);
-    }
-    if let Some(p) = std::env::var_os("AGENTODO_STORE") {
-        return Ok(PathBuf::from(p));
-    }
-    Store::default_path().context("determining default store path")
 }
 
 fn print_one(todo: &Todo, json: bool) -> Result<()> {

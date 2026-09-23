@@ -45,6 +45,18 @@ impl Store {
         Ok(dirs.data_dir().join("todos.json"))
     }
 
+    /// Resolves the store path with the precedence every frontend shares:
+    /// an explicit `flag`, then `$AGENTODO_STORE`, then [`Store::default_path`].
+    pub fn resolve_path(flag: Option<PathBuf>) -> Result<PathBuf> {
+        if let Some(p) = flag {
+            return Ok(p);
+        }
+        if let Some(p) = std::env::var_os("AGENTODO_STORE") {
+            return Ok(PathBuf::from(p));
+        }
+        Self::default_path()
+    }
+
     /// Loads the store at `path`, or returns an empty store if the file does
     /// not exist yet.
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
@@ -250,5 +262,29 @@ impl Store {
             .position(|t| t.id == id)
             .ok_or(Error::NotFound(id))?;
         Ok(self.data.todos.remove(pos))
+    }
+
+    /// Re-inserts a previously removed todo verbatim, keeping its id and
+    /// timestamps. Used to undo a delete without the todo changing identity.
+    pub fn restore(&mut self, todo: Todo) -> Result<Todo> {
+        if self.get(todo.id).is_some() {
+            return Err(Error::IdTaken(todo.id));
+        }
+        self.data.next_id = self.data.next_id.max(todo.id + 1);
+        self.data.todos.push(todo.clone());
+        Ok(todo)
+    }
+
+    /// Overwrites the todo with the same id with `todo` verbatim, timestamps
+    /// included. Used to reapply an undo/redo snapshot.
+    pub fn replace(&mut self, todo: Todo) -> Result<Todo> {
+        let slot = self
+            .data
+            .todos
+            .iter_mut()
+            .find(|t| t.id == todo.id)
+            .ok_or(Error::NotFound(todo.id))?;
+        *slot = todo.clone();
+        Ok(todo)
     }
 }

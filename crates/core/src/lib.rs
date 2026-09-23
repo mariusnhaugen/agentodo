@@ -6,11 +6,13 @@
 mod error;
 mod filter;
 mod model;
+mod parse;
 mod store;
 
 pub use error::{Error, Result};
 pub use filter::{Filter, SortBy};
 pub use model::{NewTodo, Priority, ProjectSummary, Status, Todo, TodoPatch};
+pub use parse::{parse_quick_add, QuickAdd};
 pub use store::Store;
 
 #[cfg(test)]
@@ -251,5 +253,63 @@ mod tests {
         let projects = store.projects();
         let names: Vec<Option<&str>> = projects.iter().map(|p| p.project.as_deref()).collect();
         assert_eq!(names, vec![Some("Work"), Some("work"), None]);
+    }
+
+    #[test]
+    fn restore_keeps_original_id_and_rejects_duplicates() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        sample(&mut store);
+        let removed = store.delete(1).unwrap();
+
+        let restored = store.restore(removed.clone()).unwrap();
+        assert_eq!(restored, removed);
+        assert_eq!(store.get(1), Some(&removed));
+        assert!(matches!(store.restore(removed), Err(Error::IdTaken(1))));
+
+        // Fresh adds never collide with a restored id.
+        let next = store.add(NewTodo {
+            title: "next".into(),
+            ..Default::default()
+        });
+        assert_eq!(next.id, 3);
+    }
+
+    #[test]
+    fn restore_bumps_next_id_past_the_restored_id() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let mut ghost = store.add(NewTodo::default());
+        store.delete(ghost.id).unwrap();
+        ghost.id = 10;
+        store.restore(ghost).unwrap();
+        assert_eq!(store.add(NewTodo::default()).id, 11);
+    }
+
+    #[test]
+    fn replace_overwrites_verbatim_and_requires_existing_id() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        sample(&mut store);
+        let before = store.get(1).unwrap().clone();
+        store
+            .update(
+                1,
+                TodoPatch {
+                    title: Some("changed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        store.replace(before.clone()).unwrap();
+        assert_eq!(store.get(1), Some(&before));
+
+        let mut missing = before;
+        missing.id = 99;
+        assert!(matches!(store.replace(missing), Err(Error::NotFound(99))));
+    }
+
+    #[test]
+    fn resolve_path_prefers_explicit_flag() {
+        let p = Store::resolve_path(Some("/explicit.json".into())).unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/explicit.json"));
     }
 }

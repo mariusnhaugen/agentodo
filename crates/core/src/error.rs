@@ -6,6 +6,9 @@ pub enum Error {
     #[error("no todo found with id {0}")]
     NotFound(u64),
 
+    #[error("a todo with id {0} already exists")]
+    IdTaken(u64),
+
     #[error("could not determine a data directory for the store")]
     NoDataDir,
 
