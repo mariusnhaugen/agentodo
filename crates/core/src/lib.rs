@@ -3,6 +3,7 @@
 //! This crate holds all todo logic behind a small API ([`Store`]) so that the
 //! CLI and the MCP server are thin adapters over the same functions.
 
+mod date;
 mod error;
 mod filter;
 mod log;
@@ -10,6 +11,7 @@ mod model;
 mod parse;
 mod store;
 
+pub use date::{parse_day, parse_scheduled_filter, week_start, ScheduledFilter};
 pub use error::{Error, Result};
 pub use filter::{Filter, SortBy};
 pub use log::{log_path, read_log, read_log_from, Actor, EntryKind, FieldChange, LogEntry, Source};
@@ -28,6 +30,7 @@ mod tests {
             project: Some("home".into()),
             tags: vec!["errand".into()],
             notes: None,
+            scheduled: None,
         });
         store.add(NewTodo {
             title: "ship release".into(),
@@ -35,6 +38,7 @@ mod tests {
             project: Some("work".into()),
             tags: vec!["urgent".into()],
             notes: Some("cut the tag first".into()),
+            scheduled: None,
         });
     }
 
@@ -447,5 +451,120 @@ mod tests {
             log_path(std::path::Path::new("/data/todos.json")),
             std::path::PathBuf::from("/data/todos.log.jsonl")
         );
+    }
+
+    fn ymd(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn scheduled_is_set_cleared_and_diffed() {
+        let path = temp_store_path("scheduled");
+        let mut store = Store::load(&path).unwrap();
+        let t = store.add(NewTodo {
+            title: "plan".into(),
+            scheduled: Some(ymd(2026, 9, 25)),
+            ..Default::default()
+        });
+        assert_eq!(t.scheduled, Some(ymd(2026, 9, 25)));
+
+        let moved = store
+            .update(
+                t.id,
+                TodoPatch {
+                    scheduled: Some(Some(ymd(2026, 9, 28))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(moved.scheduled, Some(ymd(2026, 9, 28)));
+        let untouched = store.update(t.id, TodoPatch::default()).unwrap();
+        assert_eq!(untouched.scheduled, Some(ymd(2026, 9, 28)));
+        let cleared = store
+            .update(
+                t.id,
+                TodoPatch {
+                    scheduled: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.scheduled, None);
+        store.save().unwrap();
+
+        let log = read_log(&store.log_path()).unwrap();
+        let diff = log[1].diff();
+        assert_eq!(
+            (diff[0].field, diff[0].old.as_str(), diff[0].new.as_str()),
+            ("scheduled", "2026-09-25", "2026-09-28")
+        );
+        assert_eq!(log[2].diff()[0].new, ""); // the no-op update is not logged
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn todos_without_scheduled_still_load_and_stay_compact() {
+        let t = Store::load("/nonexistent/ignored.json")
+            .unwrap()
+            .add(NewTodo::default());
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("scheduled"));
+        let back: Todo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scheduled, None);
+    }
+
+    #[test]
+    fn parse_day_understands_relative_words() {
+        let fri = ymd(2026, 9, 25);
+        assert_eq!(parse_day("today", fri), Some(fri));
+        assert_eq!(parse_day("Tomorrow", fri), Some(ymd(2026, 9, 26)));
+        assert_eq!(parse_day("fri", fri), Some(fri)); // today counts
+        assert_eq!(parse_day("thursday", fri), Some(ymd(2026, 10, 1)));
+        assert_eq!(parse_day("mon", fri), Some(ymd(2026, 9, 28)));
+        assert_eq!(parse_day("2026-12-24", fri), Some(ymd(2026, 12, 24)));
+        assert_eq!(parse_day("someday", fri), None);
+    }
+
+    #[test]
+    fn week_start_is_monday_even_from_sunday() {
+        assert_eq!(week_start(ymd(2026, 9, 21)), ymd(2026, 9, 21));
+        assert_eq!(week_start(ymd(2026, 9, 25)), ymd(2026, 9, 21));
+        assert_eq!(week_start(ymd(2026, 9, 27)), ymd(2026, 9, 21));
+        assert_eq!(week_start(ymd(2026, 9, 28)), ymd(2026, 9, 28));
+    }
+
+    #[test]
+    fn filter_by_scheduled() {
+        let fri = ymd(2026, 9, 25);
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        for (title, day) in [
+            ("none", None),
+            ("mon", Some(ymd(2026, 9, 21))),
+            ("fri", Some(fri)),
+            ("next", Some(ymd(2026, 9, 28))),
+        ] {
+            store.add(NewTodo {
+                title: title.into(),
+                scheduled: day,
+                ..Default::default()
+            });
+        }
+        let titles = |f: &str| {
+            let mut v: Vec<String> = store
+                .list(&Filter {
+                    scheduled: parse_scheduled_filter(f, fri),
+                    ..Default::default()
+                })
+                .into_iter()
+                .map(|t| t.title)
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(titles("none"), ["none"]);
+        assert_eq!(titles("today"), ["fri"]);
+        assert_eq!(titles("week"), ["fri", "mon"]);
+        assert_eq!(titles("2026-09-28"), ["next"]);
     }
 }

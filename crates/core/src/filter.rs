@@ -1,3 +1,4 @@
+use crate::date::ScheduledFilter;
 use crate::model::{Priority, Status, Todo};
 
 /// How to order a list of todos.
@@ -17,6 +18,7 @@ pub struct Filter {
     pub priority: Option<Priority>,
     pub tag: Option<String>,
     pub project: Option<String>,
+    pub scheduled: Option<ScheduledFilter>,
     pub sort: SortBy,
 }
 
@@ -40,6 +42,11 @@ impl Filter {
         }
         if let Some(project) = &self.project {
             if todo.project.as_deref() != Some(project.as_str()) {
+                return false;
+            }
+        }
+        if let Some(scheduled) = &self.scheduled {
+            if !scheduled.matches(todo) {
                 return false;
             }
         }

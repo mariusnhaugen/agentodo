@@ -94,6 +94,7 @@ impl LogEntry {
         };
         let lower = |s: String| s.to_lowercase();
         let opt = |o: &Option<String>| o.clone().unwrap_or_default();
+        let day = |d: &Option<chrono::NaiveDate>| d.map(|d| d.to_string()).unwrap_or_default();
         let fields = [
             ("title", a.title.clone(), b.title.clone()),
             (
@@ -109,6 +110,7 @@ impl LogEntry {
             ("project", opt(&a.project), opt(&b.project)),
             ("tags", a.tags.join(" "), b.tags.join(" ")),
             ("notes", opt(&a.notes), opt(&b.notes)),
+            ("scheduled", day(&a.scheduled), day(&b.scheduled)),
         ];
         fields
             .into_iter()

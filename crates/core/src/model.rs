@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 /// How urgent a todo is. Ordered so `High > Medium > Low` for sorting.
@@ -34,6 +34,9 @@ pub struct Todo {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// The day you plan to work on it. A soft "do-on" date, never a deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled: Option<NaiveDate>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,11 +52,12 @@ pub struct NewTodo {
     pub project: Option<String>,
     pub tags: Vec<String>,
     pub notes: Option<String>,
+    pub scheduled: Option<NaiveDate>,
 }
 
 /// A partial update to an existing todo. `None` fields are left unchanged.
 ///
-/// `project` and `notes` are doubly-wrapped: the outer `Option` means "was this
+/// `project`, `notes` and `scheduled` are doubly-wrapped: the outer `Option` means "was this
 /// field mentioned at all?", the inner value (which may itself clear the field)
 /// is what to set it to.
 #[derive(Debug, Clone, Default)]
@@ -62,6 +66,7 @@ pub struct TodoPatch {
     pub priority: Option<Priority>,
     pub project: Option<Option<String>>,
     pub notes: Option<Option<String>>,
+    pub scheduled: Option<Option<NaiveDate>>,
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
 }

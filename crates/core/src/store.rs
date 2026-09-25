@@ -259,6 +259,7 @@ impl Store {
             project: new.project,
             tags: new.tags,
             notes: new.notes,
+            scheduled: new.scheduled,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -289,6 +290,9 @@ impl Store {
         }
         if let Some(notes) = patch.notes {
             todo.notes = notes;
+        }
+        if let Some(scheduled) = patch.scheduled {
+            todo.scheduled = scheduled;
         }
         for tag in patch.remove_tags {
             todo.tags.retain(|t| t != &tag);
