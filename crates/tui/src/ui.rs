@@ -1,5 +1,5 @@
 use agentodo_core::{EntryKind, LogEntry, Priority, SortBy, Source, Status, Todo};
-use chrono::Local;
+use chrono::{Datelike, Local, NaiveDate};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, InputKind, Mode};
+use crate::app::{App, Card, InputKind, Mode, View, WEEK_COLUMNS};
 use crate::line::LineEdit;
 
 const DIM: Style = Style::new().fg(Color::DarkGray);
@@ -25,6 +25,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Mode::Log { .. } = app.mode {
         draw_log_header(frame, app, header);
         draw_log(frame, app, list);
+    } else if app.view == View::Week {
+        draw_header(frame, app, header);
+        let [board, strip] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(list);
+        draw_week(frame, app, board);
+        draw_focus_strip(frame, app, strip);
     } else {
         draw_header(frame, app, header);
         draw_list(frame, app, list);
@@ -45,12 +51,18 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         SortBy::Created => "created",
     };
     let done = if app.show_done { "open + done" } else { "open" };
-    let left = Line::from(vec![
+    let mut left = Line::from(vec![
         " agentodo".bold(),
         Span::styled(" — ", DIM),
         Span::raw(app.project.label().to_owned()).cyan(),
         Span::styled(format!(" · {done} · sort: {sort}"), DIM),
     ]);
+    if app.view == View::Week {
+        left.spans.insert(
+            1,
+            Span::raw(format!(" week of {}", week_range(app.week))).bold(),
+        );
+    }
     let (open, done) = app.counts();
     let right = Line::from(format!(" [{open} open / {done} done] ")).right_aligned();
     // Give the counts their full width; the description truncates first.
@@ -124,6 +136,12 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(1)
         .max(3) as u16;
 
+    let when_width = if app.rows.iter().any(|t| t.scheduled.is_some()) {
+        6
+    } else {
+        0
+    };
+
     let search = app.search.as_deref();
     let mut rows: Vec<Row> = app
         .rows
@@ -133,7 +151,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Some((id, line)) if id == t.id => input_line(line),
                 _ => title_line(t, search),
             };
-            todo_row(t, title, app.changed.contains(&t.id))
+            todo_row(t, title, app.changed.contains(&t.id), app.today)
         })
         .collect();
 
@@ -146,6 +164,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from("+".green()),
                     Cell::from(Line::from("new").right_aligned()).style(DIM),
                     Cell::from(input_line(line)),
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
                 ]),
@@ -162,6 +181,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(1),
             Constraint::Length(id_width),
             Constraint::Fill(1),
+            Constraint::Length(when_width),
             Constraint::Length(project_width),
             Constraint::Length(tags_width),
         ],
@@ -178,7 +198,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// One list row. `changed` marks a todo someone else touched since you last
 /// looked.
-fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool) -> Row<'a> {
+fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool, today: NaiveDate) -> Row<'a> {
     let done = t.status == Status::Done;
     let marker = if done {
         Span::raw("✓")
@@ -210,6 +230,7 @@ fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool) -> Row<'a> {
         Cell::from(marker),
         Cell::from(Line::from(t.id.to_string()).right_aligned()).style(DIM),
         Cell::from(title),
+        Cell::from(when_text(t, today)),
         Cell::from(project),
         Cell::from(tags),
     ]);
@@ -218,6 +239,270 @@ fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool) -> Row<'a> {
     } else {
         row
     }
+}
+
+/// A scheduled day, short: `Fri` within this week, `Oct 3` otherwise.
+fn when_text(t: &Todo, today: NaiveDate) -> Span<'static> {
+    let Some(day) = t.scheduled else {
+        return Span::raw("");
+    };
+    let this_week = agentodo_core::week_start(day) == agentodo_core::week_start(today);
+    let text = if this_week {
+        day.format("%a").to_string()
+    } else {
+        day.format("%b %-d").to_string()
+    };
+    if day == today {
+        Span::raw(text).yellow()
+    } else {
+        Span::raw(text).blue()
+    }
+}
+
+fn week_range(monday: NaiveDate) -> String {
+    let sunday = monday + chrono::Days::new(6);
+    if monday.month() == sunday.month() {
+        format!("{} – {}", monday.format("%b %-d"), sunday.format("%-d"))
+    } else {
+        format!("{} – {}", monday.format("%b %-d"), sunday.format("%b %-d"))
+    }
+}
+
+// ---- week board ---------------------------------------------------------------
+
+/// Lines a card may wrap to before its title is cut off.
+const CARD_LINES: usize = 2;
+
+/// `Backlog | Mon … Sun`, each column a stack of wrapped cards.
+fn draw_week(frame: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::new()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(DIM);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.page = inner.height.saturating_sub(1) as usize / CARD_LINES;
+
+    let columns = Layout::horizontal([Constraint::Fill(1); WEEK_COLUMNS]).split(inner);
+    for (col, &area) in columns.iter().enumerate() {
+        draw_column(frame, app, col, area);
+    }
+}
+
+fn draw_column(frame: &mut Frame, app: &App, col: usize, area: Rect) {
+    let focused = col == app.col;
+    let block = if col == 0 {
+        Block::new()
+    } else {
+        Block::new().borders(Borders::LEFT).border_style(DIM)
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+
+    let day = app.column_day(col);
+    let title = match day {
+        None => "Backlog".to_owned(),
+        Some(d) => d.format("%a %-d").to_string(),
+    };
+    let mut head_style = if day == Some(app.today) {
+        Style::new().yellow().bold()
+    } else {
+        Style::new().bold()
+    };
+    if focused {
+        head_style = head_style.add_modifier(Modifier::UNDERLINED);
+    }
+    frame.render_widget(Line::styled(format!(" {title}"), head_style), head);
+
+    let width = body.width.saturating_sub(1) as usize;
+    let cards = app.column(col);
+    let cursor = focused.then_some(app.cursor);
+    let adding = matches!(
+        app.mode,
+        Mode::Input {
+            kind: InputKind::NewTodo { .. },
+            ..
+        }
+    );
+    let blocks: Vec<Vec<Line>> = cards
+        .iter()
+        .enumerate()
+        .map(|(i, card)| {
+            let selected = cursor == Some(i) && !adding;
+            card_lines(card, width, selected, app.changed.contains(&card.todo.id))
+        })
+        .collect();
+
+    // Scroll whole cards so the focused one is on screen.
+    let height = body.height as usize;
+    let mut first = 0;
+    if let Some(cursor) = cursor.filter(|&c| c < blocks.len()) {
+        // Keep a line spare for the "+N more" note below it.
+        let fits = height.saturating_sub(usize::from(cursor + 1 < blocks.len()));
+        while first < cursor && blocks[first..=cursor].iter().map(Vec::len).sum::<usize>() > fits {
+            first += 1;
+        }
+    }
+    let total: usize = blocks[first..].iter().map(Vec::len).sum();
+    // Leave a line for the overflow note when not everything fits.
+    let room = if total > height {
+        height.saturating_sub(1)
+    } else {
+        height
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    let mut shown = first;
+    for block in blocks.into_iter().skip(first) {
+        if lines.len() + block.len() > room {
+            break;
+        }
+        lines.extend(block);
+        shown += 1;
+    }
+    if shown < cards.len() && height > 0 {
+        lines.push(Line::styled(format!(" +{} more", cards.len() - shown), DIM));
+    }
+    if cards.is_empty() && focused && !adding {
+        lines.push(Line::styled(" o adds", DIM));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+}
+
+/// A card: a marker column (`•` changed, `!` high, `✓` done), then the title
+/// and slip count wrapped to at most [`CARD_LINES`] lines.
+fn card_lines(card: &Card, width: usize, selected: bool, changed: bool) -> Vec<Line<'static>> {
+    let t = &card.todo;
+    let done = t.status == Status::Done;
+    let marker = if changed {
+        "•".cyan().bold()
+    } else if done {
+        Span::styled("✓", DIM)
+    } else {
+        match t.priority {
+            Priority::High => "!".red().bold(),
+            Priority::Medium => Span::raw("·").dark_gray(),
+            Priority::Low => Span::raw(" "),
+        }
+    };
+    let mut style = if done {
+        DIM.add_modifier(Modifier::CROSSED_OUT)
+    } else {
+        Style::new()
+    };
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    let mut text = t.title.clone();
+    if card.slipped > 0 {
+        text.push_str(&format!(" ↻{}", card.slipped));
+    }
+    wrap(&text, width.max(1), CARD_LINES)
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let lead = if i == 0 {
+                marker.clone()
+            } else {
+                Span::raw(" ")
+            };
+            let pad = width.saturating_sub(line.chars().count());
+            let body = if selected {
+                format!("{line}{}", " ".repeat(pad))
+            } else {
+                line
+            };
+            Line::from(vec![lead, Span::styled(body, style)])
+        })
+        .collect()
+}
+
+/// Word-wraps `text` to `width` columns over at most `max` lines, ending the
+/// last with `…` when it doesn't fit. Words longer than a line are split.
+fn wrap(text: &str, width: usize, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        loop {
+            let used = line.chars().count();
+            let gap = usize::from(used > 0);
+            if used + gap + word.len() <= width {
+                if gap == 1 {
+                    line.push(' ');
+                }
+                line.extend(&word);
+                break;
+            }
+            if used > 0 {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            // Longer than a whole line: split it.
+            line.extend(&word[..width]);
+            word.drain(..width);
+            lines.push(std::mem::take(&mut line));
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > max {
+        lines.truncate(max);
+        let last = &mut lines[max - 1];
+        let keep = width.saturating_sub(1).min(last.chars().count());
+        *last = last.chars().take(keep).collect::<String>() + "…";
+    }
+    lines
+}
+
+/// The focused card in full, or the line being typed for it.
+fn draw_focus_strip(frame: &mut Frame, app: &App, area: Rect) {
+    if let Mode::Input {
+        kind: kind @ (InputKind::NewTodo { .. } | InputKind::EditTitle(_)),
+        line,
+    } = &app.mode
+    {
+        let label = match kind {
+            InputKind::NewTodo { .. } => match app.column_day(app.col) {
+                Some(day) => format!(" new on {}: ", day.format("%a %-d")),
+                None => " new in Backlog: ".to_owned(),
+            },
+            _ => " title: ".to_owned(),
+        };
+        let mut spans = vec![Span::styled(label, DIM)];
+        spans.extend(input_line(line).spans);
+        frame.render_widget(Line::from(spans), area);
+        return;
+    }
+    let Some(t) = app.current() else {
+        return frame.render_widget(Line::styled(" (empty column)", DIM), area);
+    };
+    let mut spans = vec![
+        Span::styled(format!(" #{} ", t.id), DIM),
+        Span::raw(t.title.clone()).bold(),
+    ];
+    if let Some(p) = t.project.as_deref().filter(|p| !p.is_empty()) {
+        spans.push(Span::raw(format!(" +{p}")).cyan());
+    }
+    if !t.tags.is_empty() {
+        spans.push(Span::raw(format!(" {}", tags_text(t))).magenta());
+    }
+    let prio = match t.priority {
+        Priority::High => "!h".red(),
+        Priority::Medium => "!m".yellow(),
+        Priority::Low => "!l".dark_gray(),
+    };
+    spans.extend([" ".into(), prio]);
+    if let Some(day) = t.scheduled {
+        spans.push(Span::styled(
+            format!(" · planned {}", day.format("%a %b %-d")),
+            DIM,
+        ));
+    }
+    frame.render_widget(Line::from(spans), area);
 }
 
 fn tags_text(t: &Todo) -> String {
@@ -291,6 +576,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Input { .. } => (" INSERT ", Color::Green),
         Mode::Picker { .. } => (" PROJECT ", Color::Cyan),
         Mode::Log { .. } => (" LOG ", Color::Magenta),
+        _ if app.view == View::Week => (" WEEK ", Color::Yellow),
         _ => (" NORMAL ", Color::Blue),
     };
     let mut spans = vec![
@@ -306,6 +592,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         )),
         (None, Mode::Log { .. }) => spans.push(Span::styled(
             "j/k move · Enter go to todo · r revert · a others only · q back",
+            DIM,
+        )),
+        (None, _) if app.view == View::Week => spans.push(Span::styled(
+            "h/l day · H/L shove · gt today · gb backlog · gw pick day · C-n/C-p week · W list",
             DIM,
         )),
         (None, _) => spans.push(Span::styled(
@@ -510,6 +800,7 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         ("p", "filter by project"),
         (".", "show / hide done"),
         ("s", "sort priority / created"),
+        ("W  :week", "week board (:list back)"),
         (":project [p]", "filter; no name = all"),
         (":sort p|c", "sort priority / created"),
         (":hide :show", "hide / show done"),
@@ -518,6 +809,21 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         (":seen", "clear • markers"),
         ("q", "quit"),
         ("?", "this help"),
+    ],
+};
+
+const WEEK_KEYS: HelpSection = HelpSection {
+    title: "week",
+    note: "planning board",
+    keys: &[
+        ("h l", "previous / next column"),
+        ("H L 3L", "shove a day earlier / later"),
+        ("gt", "schedule for today"),
+        ("gb", "back to Backlog"),
+        ("gw m..u b", "send to weekday / Backlog"),
+        ("C-n C-p", "next / previous week"),
+        ("o O", "add on this column's day"),
+        ("↻3", "slipped 3 days, shown today"),
     ],
 };
 
@@ -560,7 +866,9 @@ fn draw_help(frame: &mut Frame) {
     let mut vim = section_lines(&VIM_KEYS);
     vim.push(Line::default());
     vim.extend(section_lines(&QUICK_ADD_KEYS));
-    let ours = section_lines(&AGENTODO_KEYS);
+    let mut ours = section_lines(&AGENTODO_KEYS);
+    ours.push(Line::default());
+    ours.extend(section_lines(&WEEK_KEYS));
 
     let width = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 1;
     let (left, right) = (width(&vim), width(&ours));
@@ -840,5 +1148,86 @@ mod tests {
         for y in 0..buf.area.height {
             println!("{}", row_text(&buf, y));
         }
+    }
+
+    #[test]
+    fn wrap_breaks_words_and_ellipsizes() {
+        assert_eq!(
+            wrap("bulk add shopping in flat rota", 10, 2),
+            ["bulk add", "shopping…"]
+        );
+        assert_eq!(wrap("IaC project", 10, 2), ["IaC", "project"]);
+        assert_eq!(wrap("supercalifragilistic", 8, 2), ["supercal", "ifragil…"]);
+        assert_eq!(wrap("short", 10, 2), ["short"]);
+    }
+
+    fn friday() -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 25).unwrap()
+    }
+
+    #[test]
+    fn week_board_renders_columns_cards_and_focus_strip() {
+        let ts = TempStore::new();
+        ts.seed(&["someday thing", "refactor store !h +agentodo #core"]);
+        let mut store = ts.store();
+        store
+            .update(
+                2,
+                agentodo_core::TodoPatch {
+                    scheduled: Some(Some(chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.save().unwrap();
+        let mut app = ts.app();
+        app.set_clock(friday);
+        press(&mut app, ":week<CR>");
+
+        let buf = render(&mut app, 120, 12);
+        assert!(row_text(&buf, 0).contains("week of Sep 21 – 27"));
+        let heads = row_text(&buf, 2);
+        for day in ["Backlog", "Mon 21", "Wed 23", "Fri 25", "Sun 27"] {
+            assert!(heads.contains(day), "{day} in {heads:?}");
+        }
+        // The Wednesday card slipped to Friday, today's column.
+        let y = find_row(&buf, "refactor");
+        let x = row_text(&buf, y).find("refactor").unwrap();
+        let fri = heads.find("Fri 25").unwrap();
+        assert!(x >= fri, "slipped card sits under today");
+        assert!(find_row(&buf, "↻2") >= y);
+        assert!(row_text(&buf, y).contains("!refactor"));
+
+        let strip = row_text(&buf, 10);
+        assert!(
+            strip.contains("#2 refactor store +agentodo #core !h"),
+            "{strip:?}"
+        );
+        assert!(row_text(&buf, 11).contains("WEEK"));
+
+        press(&mut app, "5h");
+        let buf = render(&mut app, 120, 12);
+        assert!(row_text(&buf, 10).contains("#1 someday thing"));
+        press(&mut app, "ohello");
+        let buf = render(&mut app, 120, 12);
+        assert!(row_text(&buf, 10).contains("new in Backlog: hello"));
+    }
+
+    #[test]
+    fn full_columns_scroll_to_the_cursor_and_count_the_rest() {
+        let ts = TempStore::new();
+        let titles: Vec<String> = (1..=9).map(|i| format!("task {i}")).collect();
+        ts.seed(&titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut app = ts.app();
+        app.set_clock(friday);
+        press(&mut app, ":week<CR>");
+        press(&mut app, "5h");
+        // Body is 4 lines: 3 cards plus the overflow note.
+        let buf = render(&mut app, 120, 10);
+        assert!(find_row(&buf, "+6 more") > 0);
+        press(&mut app, "G");
+        let buf = render(&mut app, 120, 10);
+        let last = &app.current().unwrap().title.clone();
+        find_row(&buf, last);
     }
 }

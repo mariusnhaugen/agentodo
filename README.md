@@ -32,16 +32,19 @@ cargo build --release        # binary at target/release/agentodo
 
 agentodo add "ship release" --priority high --project work --tag urgent
 agentodo add "buy milk" -p low -t home -n "oat, not almond"
+agentodo add "refactor store" --scheduled fri   # plan it for a day
 
 agentodo list                          # open todos, highest priority first
 agentodo list --status all
 agentodo list --project work
 agentodo list --tag urgent --sort created
+agentodo list --scheduled week         # also: today, fri, 2026-10-02, none
 
 agentodo show 1
 agentodo done 1
 agentodo undone 1
 agentodo edit 2 --priority high --add-tag blocked --project ""   # "" clears project
+agentodo edit 2 --scheduled none       # back to unscheduled
 agentodo rm 2
 
 agentodo projects            # distinct projects with open/done counts
@@ -70,6 +73,27 @@ the app for the full list.
 | `p`, `.`, `s` | project filter, show/hide done, toggle sort |
 | `:q` `:project [name]` `:sort priority\|created` `:hide` `:show` | commands |
 | `]c` `[c`, `:log`, `:seen` | jump between changed todos, change log, clear markers |
+| `W`, `:week` `:list` | switch between the list and the week board |
+
+### Week board
+
+`W` opens a `Backlog | Mon … Sun` board for planning your week. Each todo can
+have a **scheduled** day. It's a soft "do-on" date, not a deadline, so you can
+move cards around freely. Backlog holds open todos with no day. An open todo
+whose day has passed shows on today with `↻N` (days slipped), and its stored
+date is left alone until you move it. Done todos stay on their day, dimmed.
+
+| Keys | Action |
+|---|---|
+| `h` `l`, `j` `k` | move between days / within a day |
+| `H` `L` (with counts) | shove a card a day earlier / later; past Sunday rolls into next week, before Monday is Backlog |
+| `gt`, `gb` | schedule for today / send back to Backlog (also work in the list) |
+| `gw` + `m t w r f s u` / `b` | send to that weekday of the week on screen / Backlog |
+| `C-n` `C-p` | next / previous week |
+| `o` `O` | add a todo on the focused column's day |
+
+Everything else (`x`, `+` `-`, `dd`, `u`, `e`, `Enter`, `/`) works as in the list,
+on the focused column.
 
 Every change is written immediately (reload → edit → save), and the store file is
 polled every second, so todos an agent adds over MCP appear while you watch
@@ -92,7 +116,9 @@ A revert is an ordinary change, so `u` undoes it.
 ## MCP server
 
 `agentodo-mcp` speaks the MCP stdio transport (newline-delimited JSON-RPC 2.0) and
-exposes seven tools, each mapping to one core operation:
+exposes seven tools, each mapping to one core operation. `add_todo`,
+`update_todo` and `list_todos` take a `scheduled` day using the same words as the
+CLI, so an agent can plan your week:
 
 `add_todo`, `list_todos`, `get_todo`, `complete_todo`, `update_todo`, `delete_todo`,
 `list_projects`.
@@ -125,7 +151,8 @@ cargo clippy --workspace
 
 ## Not in v1 (deferred by design)
 
-Markdown / Obsidian export, due dates, and subtasks are intentionally out of scope.
+Markdown / Obsidian export, due dates (deadlines, as opposed to the soft
+scheduled day), and subtasks are intentionally out of scope.
 The core store is structured so these slot in without reworking the CLI or MCP
 layers — e.g. an `export` command would render the store to markdown while JSON
 remains the source of truth.

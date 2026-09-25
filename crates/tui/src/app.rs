@@ -8,10 +8,10 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use agentodo_core::{
-    log_path, parse_quick_add, read_log, read_log_from, EntryKind, Filter, LogEntry, NewTodo,
-    Priority, ProjectSummary, SortBy, Source, Status, Store, Todo, TodoPatch,
+    log_path, parse_quick_add, read_log, read_log_from, week_start, EntryKind, Filter, LogEntry,
+    NewTodo, Priority, ProjectSummary, SortBy, Source, Status, Store, Todo, TodoPatch,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
@@ -65,6 +65,27 @@ pub enum InputKind {
     Command,
     /// `/`, remembering where the cursor started so Esc can return there.
     Search { origin: usize },
+}
+
+/// Which screen normal mode is on. Overlays (help, log, picker…) work over
+/// either.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum View {
+    #[default]
+    List,
+    /// `Backlog | Mon … Sun`, planned by scheduled day.
+    Week,
+}
+
+/// Columns on the week board: Backlog, then Monday to Sunday.
+pub const WEEK_COLUMNS: usize = 8;
+
+/// A todo as placed on the week board.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Card {
+    pub todo: Todo,
+    /// Days an open todo has slipped past its scheduled day; 0 if it hasn't.
+    pub slipped: i64,
 }
 
 /// Which project the list is narrowed to.
@@ -129,6 +150,9 @@ impl Change {
     }
 }
 
+/// The pending op after `gw`, waiting for a day key.
+const DAY_PICK: char = '@';
+
 /// Keys typed so far in normal mode that don't form a command yet (`3`, `d`, `g`…).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pending {
@@ -140,7 +164,10 @@ impl Pending {
     /// Rendered like vim's `showcmd`.
     pub fn display(&self) -> String {
         let mut s = self.count.map(|c| c.to_string()).unwrap_or_default();
-        s.extend(self.op);
+        match self.op {
+            Some(DAY_PICK) => s.push_str("gw"),
+            op => s.extend(op),
+        }
         s
     }
 }
@@ -180,6 +207,18 @@ pub struct App {
     seen: DateTime<Utc>,
     /// Todos changed by someone else since `seen` that you haven't moved past.
     pub changed: HashSet<u64>,
+    pub view: View,
+    /// The Monday of the week on the board.
+    pub week: NaiveDate,
+    /// The focused board column: 0 is Backlog, 1–7 are Monday–Sunday.
+    pub col: usize,
+    /// Today's date, refreshed on every reload so the board follows midnight.
+    pub today: NaiveDate,
+    clock: fn() -> NaiveDate,
+}
+
+fn local_today() -> NaiveDate {
+    Local::now().date_naive()
 }
 
 impl App {
@@ -209,6 +248,11 @@ impl App {
             log_offset: 0,
             seen: seen.unwrap_or_else(Utc::now),
             changed: HashSet::new(),
+            view: View::List,
+            week: week_start(local_today()),
+            col: 0,
+            today: local_today(),
+            clock: local_today,
         };
         let store = app.repo.load()?;
         app.absorb(store);
@@ -244,6 +288,7 @@ impl App {
     }
 
     fn absorb(&mut self, store: Store) {
+        self.today = (self.clock)();
         self.projects = store.projects();
         self.all = store.all().to_vec();
         self.read_new_log_entries();
@@ -270,6 +315,10 @@ impl App {
     }
 
     fn rebuild_rows(&mut self) {
+        if self.view == View::Week {
+            self.rows = self.column(self.col).into_iter().map(|c| c.todo).collect();
+            return self.follow_cursor();
+        }
         let mut rows: Vec<Todo> = self
             .all
             .iter()
@@ -285,8 +334,11 @@ impl App {
         // Stable, so open todos keep their sort order above done ones.
         rows.sort_by_key(|t| t.status == Status::Done);
         self.rows = rows;
+        self.follow_cursor();
+    }
 
-        // Follow the todo we were on; if it's gone, stay at the same height.
+    /// Follows the todo we were on; if it's gone, stays at the same height.
+    fn follow_cursor(&mut self) {
         let found = self
             .cursor_id
             .and_then(|id| self.rows.iter().position(|t| t.id == id));
@@ -300,7 +352,176 @@ impl App {
 
     fn focus(&mut self, id: u64) {
         self.cursor_id = Some(id);
+        if self.view == View::Week {
+            self.place(id);
+        }
         self.rebuild_rows();
+    }
+
+    // ---- week board -----------------------------------------------------------
+
+    /// Sets the view's clock; tests pin it to a known day.
+    #[cfg(test)]
+    pub fn set_clock(&mut self, clock: fn() -> NaiveDate) {
+        self.clock = clock;
+        self.today = clock();
+        self.week = week_start(self.today);
+        self.rebuild_rows();
+    }
+
+    /// The day board column `col` stands for, in the week on screen.
+    pub fn column_day(&self, col: usize) -> Option<NaiveDate> {
+        (col > 0).then(|| self.week + Days::new(col as u64 - 1))
+    }
+
+    fn day_column(day: NaiveDate) -> usize {
+        day.weekday().num_days_from_monday() as usize + 1
+    }
+
+    /// The day a todo shows on: its scheduled day, except that open todos
+    /// that slipped past it show on today. `None` means Backlog.
+    fn shown_on(&self, t: &Todo) -> Option<NaiveDate> {
+        match t.scheduled {
+            Some(day) if t.status == Status::Open && day < self.today => Some(self.today),
+            day => day,
+        }
+    }
+
+    /// Which column a todo sits in on the week on screen, if any. Slipped
+    /// todos move to today only on this week's board; past weeks keep them
+    /// on the day they were planned for.
+    fn column_of(&self, t: &Todo) -> Option<usize> {
+        let day = match t.scheduled {
+            None => return (t.status == Status::Open).then_some(0),
+            Some(_) if week_start(self.today) == self.week => self.shown_on(t)?,
+            Some(day) => day,
+        };
+        (week_start(day) == self.week).then(|| Self::day_column(day))
+    }
+
+    /// One board column's cards, sorted like the list with done ones last.
+    pub fn column(&self, col: usize) -> Vec<Card> {
+        let mut todos: Vec<Todo> = self
+            .all
+            .iter()
+            .filter(|t| self.project.matches(t))
+            .filter(|t| self.show_done || t.status == Status::Open)
+            .filter(|t| self.column_of(t) == Some(col))
+            .cloned()
+            .collect();
+        Filter {
+            sort: self.sort,
+            ..Default::default()
+        }
+        .sort(&mut todos);
+        todos.sort_by_key(|t| t.status == Status::Done);
+        todos
+            .into_iter()
+            .map(|todo| {
+                let slipped = match todo.scheduled {
+                    Some(day) if todo.status == Status::Open && day < self.today => {
+                        (self.today - day).num_days()
+                    }
+                    _ => 0,
+                };
+                Card { todo, slipped }
+            })
+            .collect()
+    }
+
+    /// Moves the board to wherever todo `id` shows.
+    fn place(&mut self, id: u64) {
+        let Some(t) = self.all.iter().find(|t| t.id == id) else {
+            return;
+        };
+        match (t.status, self.shown_on(t)) {
+            (_, Some(day)) => {
+                self.week = week_start(day);
+                self.col = Self::day_column(day);
+            }
+            (Status::Open, None) => self.col = 0,
+            (Status::Done, None) => {}
+        }
+    }
+
+    fn set_view(&mut self, view: View) {
+        self.view = view;
+        if view == View::Week {
+            self.week = week_start(self.today);
+            self.col = Self::day_column(self.today);
+            if let Some(id) = self.cursor_id {
+                self.place(id);
+            }
+        }
+        self.rebuild_rows();
+    }
+
+    fn move_column(&mut self, delta: isize) {
+        let col = self.col as isize + delta;
+        self.col = col.clamp(0, WEEK_COLUMNS as isize - 1) as usize;
+        self.rebuild_rows();
+    }
+
+    fn move_week(&mut self, weeks: i64) {
+        self.week = if weeks >= 0 {
+            self.week + Days::new(7 * weeks as u64)
+        } else {
+            self.week - Days::new(7 * weeks.unsigned_abs())
+        };
+        self.rebuild_rows();
+    }
+
+    /// `L`/`H`: `days` later or earlier than the column the card is in.
+    /// From Backlog, `L` lands on Monday; earlier than Monday is Backlog.
+    fn shove(&mut self, days: i64) {
+        let Some(id) = self.current().map(|t| t.id) else {
+            return;
+        };
+        let day = match self.column_day(self.col) {
+            None if days > 0 => Some(self.week + Days::new(days as u64 - 1)),
+            None => return,
+            Some(day) if days >= 0 => Some(day + Days::new(days as u64)),
+            Some(day) => Some(day - Days::new(days.unsigned_abs())).filter(|d| *d >= self.week),
+        };
+        self.schedule(id, day);
+    }
+
+    /// Sets todo `id`'s scheduled day and follows it there.
+    fn schedule(&mut self, id: u64, day: Option<NaiveDate>) {
+        self.update(id, |s, id| {
+            s.update(
+                id,
+                TodoPatch {
+                    scheduled: Some(day),
+                    ..Default::default()
+                },
+            )
+        });
+        self.focus(id);
+    }
+
+    fn schedule_current(&mut self, day: Option<NaiveDate>) {
+        if let Some(id) = self.current().map(|t| t.id) {
+            self.schedule(id, day);
+        }
+    }
+
+    /// After `gw`: `m t w r f s u` pick a day of the week on screen, `b` Backlog.
+    fn pick_day(&mut self, key: KeyCode) {
+        let col = match key {
+            KeyCode::Char('b') => 0,
+            KeyCode::Char(c) => match "mtwrfsu".find(c) {
+                Some(i) => i + 1,
+                None => return,
+            },
+            _ => return,
+        };
+        // The list has no week on screen, so it picks from this week.
+        let monday = match self.view {
+            View::Week => self.week,
+            View::List => week_start(self.today),
+        };
+        self.schedule_current((col > 0).then(|| monday + Days::new(col as u64 - 1)));
     }
 
     fn info(&mut self, text: impl Into<String>) {
@@ -367,6 +588,24 @@ impl App {
                     self.select(count.map_or(0, |n| n.saturating_sub(1)));
                     Effect::None
                 }
+                ('g', KeyCode::Char('b')) => {
+                    self.schedule_current(None);
+                    Effect::None
+                }
+                ('g', KeyCode::Char('t')) => {
+                    self.schedule_current(Some(self.today));
+                    Effect::None
+                }
+                ('g', KeyCode::Char('w')) => {
+                    if self.current().is_some() {
+                        self.pending.op = Some(DAY_PICK);
+                    }
+                    Effect::None
+                }
+                (DAY_PICK, key) => {
+                    self.pick_day(key);
+                    Effect::None
+                }
                 ('g', KeyCode::Char('p')) => {
                     self.start_input_on_current(|t| {
                         let project = t.project.clone().unwrap_or_default();
@@ -416,7 +655,21 @@ impl App {
                 self.select(self.cursor.saturating_sub((self.page / 2).max(1)))
             }
             KeyCode::Char('r') if ctrl => self.redo(),
+            KeyCode::Char('n') if ctrl && self.view == View::Week => self.move_week(n as i64),
+            KeyCode::Char('p') if ctrl && self.view == View::Week => self.move_week(-(n as i64)),
             _ if ctrl => {}
+            KeyCode::Char('W') => self.set_view(match self.view {
+                View::List => View::Week,
+                View::Week => View::List,
+            }),
+            KeyCode::Char('h') | KeyCode::Left if self.view == View::Week => {
+                self.move_column(-(n as isize))
+            }
+            KeyCode::Char('l') | KeyCode::Right if self.view == View::Week => {
+                self.move_column(n as isize)
+            }
+            KeyCode::Char('H') if self.view == View::Week => self.shove(-(n as i64)),
+            KeyCode::Char('L') if self.view == View::Week => self.shove(n as i64),
             KeyCode::Char('j') | KeyCode::Down => self.select(self.cursor.saturating_add(n)),
             KeyCode::Char('k') | KeyCode::Up => self.select(self.cursor.saturating_sub(n)),
             KeyCode::Char('G') => match count {
@@ -786,6 +1039,13 @@ impl App {
             "h" | "help" => self.mode = Mode::Help,
             "hide" => self.set_show_done(false),
             "log" => self.open_log(),
+            "list" => self.set_view(View::List),
+            "week" => {
+                self.set_view(View::Week);
+                self.week = week_start(self.today);
+                self.col = Self::day_column(self.today);
+                self.rebuild_rows();
+            }
             "seen" => {
                 self.changed.clear();
                 self.info("change markers cleared");
@@ -874,6 +1134,10 @@ impl App {
             project,
             tags: parsed.tags,
             notes: None,
+            scheduled: match self.view {
+                View::List => None,
+                View::Week => self.column_day(self.col),
+            },
         };
         match self.repo.with_store(|s| Ok(s.add(new))) {
             Ok(todo) => {
@@ -1097,6 +1361,7 @@ pub(crate) mod tests {
                     project: q.project,
                     tags: q.tags,
                     notes: None,
+                    scheduled: None,
                 });
             }
             store.save().unwrap();
@@ -1721,5 +1986,263 @@ pub(crate) mod tests {
         press(&mut app, "u");
         assert!(app.message.as_ref().unwrap().error);
         assert!(app.rows.is_empty());
+    }
+
+    // ---- week board -----------------------------------------------------------
+
+    fn ymd(m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, m, d).unwrap()
+    }
+
+    /// Friday 25 September 2026; the board's week is Mon 21 – Sun 27.
+    fn friday() -> NaiveDate {
+        ymd(9, 25)
+    }
+
+    /// Seeds `(title, scheduled)` todos in order, so ids start at 1.
+    fn seed_days(ts: &TempStore, todos: &[(&str, Option<NaiveDate>)]) {
+        let mut store = ts.store();
+        for (title, scheduled) in todos {
+            store.add(NewTodo {
+                title: (*title).into(),
+                scheduled: *scheduled,
+                ..Default::default()
+            });
+        }
+        store.save().unwrap();
+    }
+
+    fn week_app(ts: &TempStore) -> App {
+        let mut app = ts.app();
+        app.set_clock(friday);
+        press(&mut app, ":week<CR>");
+        app
+    }
+
+    fn column_titles(app: &App, col: usize) -> Vec<String> {
+        app.column(col).into_iter().map(|c| c.todo.title).collect()
+    }
+
+    fn scheduled(ts: &TempStore, id: u64) -> Option<NaiveDate> {
+        ts.store().get(id).unwrap().scheduled
+    }
+
+    #[test]
+    fn board_places_todos_by_day_with_backlog_first() {
+        let ts = TempStore::new();
+        seed_days(
+            &ts,
+            &[
+                ("loose", None),
+                ("mon", Some(ymd(9, 21))),
+                ("sun", Some(ymd(9, 27))),
+                ("next week", Some(ymd(9, 28))),
+            ],
+        );
+        let app = week_app(&ts);
+        assert_eq!(app.week, ymd(9, 21));
+        assert_eq!(app.col, 5, "opens on today");
+        assert_eq!(column_titles(&app, 0), ["loose"]);
+        assert_eq!(column_titles(&app, 1), Vec::<String>::new(), "mon slipped");
+        assert_eq!(column_titles(&app, 7), ["sun"]);
+        assert!(app.column(5).iter().any(|c| c.todo.title == "mon"));
+    }
+
+    #[test]
+    fn slipped_todos_show_on_today_but_keep_their_date() {
+        let ts = TempStore::new();
+        seed_days(
+            &ts,
+            &[
+                ("tuesday", Some(ymd(9, 22))),
+                ("last week", Some(ymd(9, 16))),
+            ],
+        );
+        let mut app = week_app(&ts);
+        let today: Vec<(String, i64)> = app
+            .column(5)
+            .into_iter()
+            .map(|c| (c.todo.title, c.slipped))
+            .collect();
+        assert!(today.contains(&("tuesday".into(), 3)));
+        assert!(today.contains(&("last week".into(), 9)));
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 22)), "nothing rewritten");
+
+        // Last week's board shows it where it was planned.
+        press(&mut app, "<C-p>");
+        assert_eq!(app.week, ymd(9, 14));
+        assert_eq!(column_titles(&app, 3), ["last week"]);
+        press(&mut app, "<C-n><C-n>");
+        assert_eq!(app.week, ymd(9, 28));
+        assert!((0..WEEK_COLUMNS).skip(1).all(|c| app.column(c).is_empty()));
+    }
+
+    #[test]
+    fn done_todos_stay_on_their_day_and_leave_backlog() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("planned", Some(ymd(9, 22))), ("loose", None)]);
+        let mut app = week_app(&ts);
+        press(&mut app, "x"); // on today's column: the slipped "planned"
+        assert_eq!(column_titles(&app, 2), ["planned"], "back on Tuesday");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 22)));
+
+        press(&mut app, "hhhhhx");
+        assert_eq!(app.col, 0);
+        assert!(app.column(0).is_empty(), "done never sits in Backlog");
+
+        press(&mut app, ":hide<CR>");
+        assert!(app.column(2).is_empty());
+    }
+
+    #[test]
+    fn shift_l_h_shove_a_day_and_the_cursor_follows() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("card", Some(ymd(9, 25)))]);
+        let mut app = week_app(&ts);
+
+        press(&mut app, "L");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 26)));
+        assert_eq!((app.col, current_title(&app)), (6, "card"));
+        press(&mut app, "H");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 25)));
+        assert_eq!(app.col, 5);
+
+        // Into the past it slips, so it stays on today.
+        press(&mut app, "2H");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 23)));
+        assert_eq!(app.col, 5);
+
+        // Past Sunday rolls into next week and the board follows.
+        press(&mut app, "3L");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 28)));
+        assert_eq!((app.week, app.col), (ymd(9, 28), 1));
+
+        // Earlier than Monday is Backlog; L from Backlog is Monday.
+        press(&mut app, "H");
+        assert_eq!(scheduled(&ts, 1), None);
+        assert_eq!(app.col, 0);
+        press(&mut app, "L");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 28)));
+        assert_eq!(app.col, 1);
+    }
+
+    #[test]
+    fn slipped_card_shoves_from_today() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("late", Some(ymd(9, 22)))]);
+        let mut app = week_app(&ts);
+        press(&mut app, "L");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 26)));
+    }
+
+    #[test]
+    fn gb_gt_gw_send_a_card_somewhere() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("card", Some(ymd(9, 27)))]);
+        let mut app = week_app(&ts);
+        press(&mut app, "llL"); // over to Sunday, then shove into next Monday
+        assert_eq!(app.week, ymd(9, 28));
+
+        press(&mut app, "gt");
+        assert_eq!(scheduled(&ts, 1), Some(friday()));
+        assert_eq!((app.week, app.col), (ymd(9, 21), 5));
+
+        press(&mut app, "gw");
+        assert_eq!(app.pending.display(), "gw");
+        press(&mut app, "r");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 24)));
+        press(&mut app, "gwu");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 27)));
+        press(&mut app, "gwb");
+        assert_eq!(scheduled(&ts, 1), None);
+        press(&mut app, "gwz"); // not a day: nothing happens
+        assert_eq!(scheduled(&ts, 1), None);
+
+        press(&mut app, "gb");
+        assert_eq!(app.col, 0);
+    }
+
+    #[test]
+    fn moves_undo_in_one_step() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("card", Some(ymd(9, 25)))]);
+        let mut app = week_app(&ts);
+        press(&mut app, "3L");
+        press(&mut app, "u");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 25)));
+        assert_eq!((app.week, app.col), (ymd(9, 21), 5), "follows it back");
+        press(&mut app, "<C-r>");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 28)));
+    }
+
+    #[test]
+    fn o_adds_to_the_focused_column() {
+        let ts = TempStore::new();
+        let mut app = week_app(&ts);
+        press(&mut app, "lotomorrow<CR>");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 26)));
+        press(&mut app, "6hosomeday !h<CR>");
+        assert_eq!(scheduled(&ts, 2), None);
+        assert_eq!(column_titles(&app, 0), ["someday"]);
+    }
+
+    #[test]
+    fn h_l_move_between_columns_and_clamp() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("a", None), ("b", None), ("sat", Some(ymd(9, 26)))]);
+        let mut app = week_app(&ts);
+        press(&mut app, "5h");
+        assert_eq!(app.col, 0);
+        press(&mut app, "jh");
+        assert_eq!((app.col, app.cursor), (0, 1));
+        press(&mut app, "6l");
+        assert_eq!((app.col, current_title(&app)), (6, "sat"), "row clamps");
+        press(&mut app, "9l");
+        assert_eq!(app.col, 7);
+    }
+
+    #[test]
+    fn w_toggles_views_keeping_the_todo() {
+        let ts = TempStore::new();
+        seed_days(
+            &ts,
+            &[("thu", Some(ymd(9, 24))), ("far", Some(ymd(10, 15)))],
+        );
+        let mut app = ts.app();
+        app.set_clock(friday);
+        app.sort = SortBy::Created;
+        app.rebuild_rows();
+        app.select(0);
+        assert_eq!(current_title(&app), "far");
+
+        press(&mut app, "W");
+        assert_eq!(app.view, View::Week);
+        assert_eq!((app.week, app.col), (ymd(10, 12), 4));
+        assert_eq!(current_title(&app), "far");
+
+        press(&mut app, "W");
+        assert_eq!(app.view, View::List);
+        assert_eq!(current_title(&app), "far");
+        assert_eq!(app.rows.len(), 2);
+
+        press(&mut app, ":week<CR>");
+        assert_eq!((app.week, app.col), (ymd(9, 21), 5), ":week opens on today");
+        press(&mut app, ":list<CR>");
+        assert_eq!(app.view, View::List);
+    }
+
+    #[test]
+    fn list_view_gt_schedules_without_leaving_the_list() {
+        let ts = TempStore::new();
+        seed_days(&ts, &[("card", None)]);
+        let mut app = ts.app();
+        app.set_clock(friday);
+        press(&mut app, "gt");
+        assert_eq!(scheduled(&ts, 1), Some(friday()));
+        press(&mut app, "gwm");
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 21)));
+        assert_eq!(app.view, View::List);
+        press(&mut app, "L"); // week-only key
+        assert_eq!(scheduled(&ts, 1), Some(ymd(9, 21)));
     }
 }
