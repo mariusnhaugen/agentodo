@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use agentodo_core::{
-    Actor, Filter, NewTodo, Priority, ProjectSummary, SortBy, Source, Status, Store, Todo,
-    TodoPatch,
+    parse_day, parse_scheduled_filter, Actor, Filter, NewTodo, Priority, ProjectSummary, SortBy,
+    Source, Status, Store, Todo, TodoPatch,
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use chrono::{Local, NaiveDate};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// A todo tracker you can drive from the command line.
@@ -56,6 +57,9 @@ struct AddArgs {
     tags: Vec<String>,
     #[arg(short, long)]
     notes: Option<String>,
+    /// Day to work on it: today, tomorrow, mon…sun or YYYY-MM-DD.
+    #[arg(short, long, value_name = "DAY")]
+    scheduled: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -68,6 +72,9 @@ struct ListArgs {
     tag: Option<String>,
     #[arg(long)]
     project: Option<String>,
+    /// Only todos scheduled on a day (today, fri, YYYY-MM-DD…), this week, or none.
+    #[arg(short, long, value_name = "DAY|week|none")]
+    scheduled: Option<String>,
     #[arg(long, value_enum, default_value_t = SortArg::Priority)]
     sort: SortArg,
 }
@@ -89,6 +96,9 @@ struct EditArgs {
     add_tag: Vec<String>,
     #[arg(long = "remove-tag", value_name = "TAG")]
     remove_tag: Vec<String>,
+    /// Set the day to work on it (today, fri, YYYY-MM-DD…), or `none` to unschedule.
+    #[arg(short, long, value_name = "DAY|none")]
+    scheduled: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -145,6 +155,7 @@ fn main() -> Result<()> {
                 project: args.project,
                 tags: args.tags,
                 notes: args.notes,
+                scheduled: args.scheduled.as_deref().map(day_arg).transpose()?,
             });
             store.save()?;
             print_one(&todo, cli.json)?;
@@ -159,6 +170,14 @@ fn main() -> Result<()> {
                 priority: args.priority.map(Into::into),
                 tag: args.tag,
                 project: args.project,
+                scheduled: args
+                    .scheduled
+                    .as_deref()
+                    .map(|s| {
+                        parse_scheduled_filter(s, today())
+                            .ok_or_else(|| anyhow!("unknown day {s:?}: try today, fri, week, none or YYYY-MM-DD"))
+                    })
+                    .transpose()?,
                 sort: args.sort.into(),
             };
             let todos = store.list(&filter);
@@ -187,6 +206,11 @@ fn main() -> Result<()> {
                 notes: args.notes.map(|n| if n.is_empty() { None } else { Some(n) }),
                 add_tags: args.add_tag,
                 remove_tags: args.remove_tag,
+                scheduled: match args.scheduled.as_deref() {
+                    None => None,
+                    Some("none") => Some(None),
+                    Some(s) => Some(Some(day_arg(s)?)),
+                },
             };
             let todo = store.update(id, patch)?;
             store.save()?;
@@ -208,6 +232,15 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn today() -> NaiveDate {
+    Local::now().date_naive()
+}
+
+fn day_arg(s: &str) -> Result<NaiveDate> {
+    parse_day(s, today())
+        .ok_or_else(|| anyhow!("unknown day {s:?}: try today, tomorrow, fri or YYYY-MM-DD"))
+}
+
 fn print_one(todo: &Todo, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(todo)?);
@@ -226,8 +259,8 @@ fn print_list(todos: &[Todo], json: bool) -> Result<()> {
         println!("No matching todos.");
         return Ok(());
     }
-    // Compact table: id, status mark, priority, title, project/tags.
-    println!("{:>4}  {:1}  {:<6}  TITLE", "ID", "", "PRIO");
+    // Compact table: id, status mark, priority, day, title, project/tags.
+    println!("{:>4}  {:1}  {:<6}  {:<6}  TITLE", "ID", "", "PRIO", "WHEN");
     for t in todos {
         let mark = match t.status {
             Status::Open => " ",
@@ -241,10 +274,13 @@ fn print_list(todos: &[Todo], json: bool) -> Result<()> {
             meta.push_str(&format!("  #{tag}"));
         }
         println!(
-            "{:>4}  [{}] {:<6}  {}{}",
+            "{:>4}  [{}] {:<6}  {:<6}  {}{}",
             t.id,
             mark,
             priority_label(t.priority),
+            t.scheduled
+                .map(|d| d.format("%a %-d").to_string())
+                .unwrap_or_default(),
             t.title,
             meta
         );
@@ -303,6 +339,9 @@ fn print_detail(t: &Todo) {
     }
     if let Some(n) = &t.notes {
         println!("  notes:    {n}");
+    }
+    if let Some(d) = t.scheduled {
+        println!("  on:       {}", d.format("%a %Y-%m-%d"));
     }
     println!("  created:  {}", t.created_at.to_rfc3339());
     if let Some(c) = t.completed_at {

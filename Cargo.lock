@@ -30,6 +30,7 @@ version = "0.1.0"
 dependencies = [
  "agentodo-core",
  "anyhow",
+ "chrono",
  "serde",
  "serde_json",
 ]

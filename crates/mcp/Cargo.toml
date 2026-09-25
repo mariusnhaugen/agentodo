@@ -14,4 +14,5 @@ path = "src/main.rs"
 agentodo-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 anyhow.workspace = true

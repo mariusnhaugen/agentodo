@@ -4,7 +4,11 @@
 
 use std::sync::OnceLock;
 
-use agentodo_core::{Actor, Filter, NewTodo, Priority, SortBy, Source, Status, Store, TodoPatch};
+use agentodo_core::{
+    parse_day, parse_scheduled_filter, Actor, Filter, NewTodo, Priority, SortBy, Source, Status,
+    Store, TodoPatch,
+};
+use chrono::{Local, NaiveDate};
 use serde_json::{json, Value};
 
 /// The result of invoking a tool: text to return to the caller, and whether it
@@ -63,14 +67,15 @@ pub fn definitions() -> Value {
                     "priority": priority_enum,
                     "project": { "type": "string", "description": "Optional project the todo belongs to." },
                     "tags": { "type": "array", "items": { "type": "string" } },
-                    "notes": { "type": "string" }
+                    "notes": { "type": "string" },
+                    "scheduled": { "type": "string", "description": "Day to work on it (a soft plan, not a deadline): today, tomorrow, mon…sun (next occurrence) or YYYY-MM-DD." }
                 },
                 "required": ["title"]
             }
         },
         {
             "name": "list_todos",
-            "description": "List todos, optionally filtered by status, priority, tag, or project.",
+            "description": "List todos, optionally filtered by status, priority, tag, project, or scheduled day.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -78,6 +83,7 @@ pub fn definitions() -> Value {
                     "priority": priority_enum,
                     "tag": { "type": "string" },
                     "project": { "type": "string" },
+                    "scheduled": { "type": "string", "description": "today, tomorrow, mon…sun, YYYY-MM-DD, week (this Monday–Sunday), or none (unscheduled)." },
                     "sort": { "type": "string", "enum": ["priority", "created"], "description": "Defaults to priority." }
                 }
             }
@@ -105,7 +111,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "update_todo",
-            "description": "Edit fields of an existing todo. Omitted fields are unchanged. Pass an empty string for project/notes to clear them.",
+            "description": "Edit fields of an existing todo. Omitted fields are unchanged. Pass an empty string for project/notes/scheduled to clear them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -114,6 +120,7 @@ pub fn definitions() -> Value {
                     "priority": priority_enum,
                     "project": { "type": "string" },
                     "notes": { "type": "string" },
+                    "scheduled": { "type": "string", "description": "Day to work on it: today, tomorrow, mon…sun or YYYY-MM-DD. Empty string or none unschedules it." },
                     "add_tags": { "type": "array", "items": { "type": "string" } },
                     "remove_tags": { "type": "array", "items": { "type": "string" } }
                 },
@@ -194,6 +201,14 @@ fn string_array(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn today() -> NaiveDate {
+    Local::now().date_naive()
+}
+
+fn day(s: &str) -> Result<NaiveDate, String> {
+    parse_day(s, today()).ok_or_else(|| format!("invalid scheduled day: {s}"))
+}
+
 // --- tool implementations ---------------------------------------------------
 
 fn add_todo(args: &Value) -> Result<Value, String> {
@@ -205,6 +220,7 @@ fn add_todo(args: &Value) -> Result<Value, String> {
         project: opt_str(args, "project"),
         tags: string_array(args, "tags"),
         notes: opt_str(args, "notes"),
+        scheduled: opt_str(args, "scheduled").as_deref().map(day).transpose()?,
     });
     store.save().map_err(|e| e.to_string())?;
     Ok(json!(todo))
@@ -227,6 +243,12 @@ fn list_todos(args: &Value) -> Result<Value, String> {
         priority: opt_priority(args)?,
         tag: opt_str(args, "tag"),
         project: opt_str(args, "project"),
+        scheduled: opt_str(args, "scheduled")
+            .map(|s| {
+                parse_scheduled_filter(&s, today())
+                    .ok_or_else(|| format!("invalid scheduled filter: {s}"))
+            })
+            .transpose()?,
         sort,
     };
     let store = load()?;
@@ -267,6 +289,11 @@ fn update_todo(args: &Value) -> Result<Value, String> {
         notes: opt_str(args, "notes").map(|n| if n.is_empty() { None } else { Some(n) }),
         add_tags: string_array(args, "add_tags"),
         remove_tags: string_array(args, "remove_tags"),
+        scheduled: match opt_str(args, "scheduled").as_deref() {
+            None => None,
+            Some("" | "none") => Some(None),
+            Some(s) => Some(Some(day(s)?)),
+        },
     };
     let mut store = load()?;
     let todo = store.update(id, patch).map_err(|e| e.to_string())?;
