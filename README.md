@@ -25,10 +25,23 @@ Todos live in a single JSON file. Resolution order:
 Writes are atomic (temp file + rename), so an interrupted write can't corrupt the
 store.
 
+## Install
+
+```sh
+cargo install --locked --path crates/cli   # agentodo
+cargo install --locked --path crates/tui   # agentodo-tui
+cargo install --locked --path crates/mcp   # agentodo-mcp
+```
+
+This copies the binaries into `~/.cargo/bin`, so they stay stable while you hack
+on the repo. Re-run the same commands (add `--force` if cargo refuses) to pick up
+new changes. `--locked` matters: without it `cargo install` ignores `Cargo.lock`
+and may pull dependency versions that need a newer rustc.
+
 ## CLI
 
 ```sh
-cargo build --release        # binary at target/release/agentodo
+cargo build --release        # dev build at target/release/agentodo
 
 agentodo add "ship release" --priority high --project work --tag urgent
 agentodo add "buy milk" -p low -t home -n "oat, not almond"
@@ -123,14 +136,21 @@ CLI, so an agent can plan your week:
 `add_todo`, `list_todos`, `get_todo`, `complete_todo`, `update_todo`, `delete_todo`,
 `list_projects`.
 
-Register it with an MCP client. For Claude Code / Claude Desktop, add to the
-`mcpServers` block:
+Register it with an MCP client. For Claude Code:
+
+```sh
+claude mcp add agentodo -s user \
+  -e AGENTODO_STORE=$HOME/.local/share/agentodo/todos.json \
+  -- $HOME/.cargo/bin/agentodo-mcp
+```
+
+Or for Claude Desktop, add to the `mcpServers` block:
 
 ```json
 {
   "mcpServers": {
     "agentodo": {
-      "command": "/absolute/path/to/target/release/agentodo-mcp",
+      "command": "/home/you/.cargo/bin/agentodo-mcp",
       "env": {
         "AGENTODO_STORE": "/home/you/.local/share/agentodo/todos.json"
       }
