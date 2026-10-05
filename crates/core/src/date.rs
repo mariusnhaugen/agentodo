@@ -20,7 +20,8 @@ pub fn parse_day(s: &str, today: NaiveDate) -> Option<NaiveDate> {
         _ => {}
     }
     if let Some(weekday) = weekday(&s) {
-        let ahead = (7 + weekday.num_days_from_monday() - today.weekday().num_days_from_monday()) % 7;
+        let ahead =
+            (7 + weekday.num_days_from_monday() - today.weekday().num_days_from_monday()) % 7;
         return today.checked_add_days(Days::new(u64::from(ahead)));
     }
     NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()

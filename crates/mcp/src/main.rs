@@ -26,7 +26,10 @@ fn main() -> io::Result<()> {
             Ok(v) => v,
             Err(_) => {
                 // Parse error, and we have no id to attribute it to.
-                write_message(&mut stdout, &error_response(Value::Null, -32700, "parse error"))?;
+                write_message(
+                    &mut stdout,
+                    &error_response(Value::Null, -32700, "parse error"),
+                )?;
                 continue;
             }
         };
@@ -78,7 +81,10 @@ fn initialize_result() -> Value {
 }
 
 fn handle_tool_call(id: Value, params: &Value) -> Value {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = tools::call(name, &args);

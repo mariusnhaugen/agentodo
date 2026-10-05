@@ -122,6 +122,7 @@ the app for the full list.
 | `]c` `[c`, `:log`, `:seen` | jump between changed todos, change log, clear markers |
 | `T`, `:stop` | start a focus timer on this todo (asks how long) / stop it |
 | `P`, `:pause` `:resume` | pause / resume the timer |
+| `S`, `gT` | stop the timer / jump to its todo, from anywhere |
 | `t` | plan time for this todo (`45m`, `2h`); empty clears it |
 | `Enter`, then `c` `dd` `a` | details, then change / delete / add time on the selected session |
 | `W`, `:week` `:list` | switch between the list and the week board |
@@ -161,7 +162,7 @@ went.
 One timer runs at a time. It lives in the store file, so it keeps going when
 you quit the TUI, and the CLI, TUI and agents all see the same timer.
 
-- **Stopping records the time**, overtime included. `T` or `:stop` stops it,
+- **Stopping records the time**, overtime included. `T`, `S` or `:stop` stops it,
   so does marking the todo done, and starting a timer on another todo
   switches. Deleting the todo drops it.
 - **Pause for interruptions.** `P` (or `agentodo pause`) stops the clock
@@ -185,10 +186,13 @@ you quit the TUI, and the CLI, TUI and agents all see the same timer.
   todo except its sessions. Session edits have their own undo, and recorded
   sessions can't be reverted from `:log`.
 
-While a timer runs, the TUI header shows `⏱ 18:42 #3 title`, and the todo's
-row (or its card on the week board) counts down, then counts up in yellow
-once it's in overtime. Paused, it shows `⏸ 18:42` dimmed. When the block is up, the TUI shows a banner and rings
-the terminal bell. Windows Terminal turns the bell into a taskbar flash. To
+While a timer runs, a player docks above the TUI's footer, like a music
+player's now-playing bar: the todo, when the block ends, and elapsed time
+against a progress bar. It's green in the block, yellow in overtime and red
+once it's 15 minutes over and looks forgotten. On a short terminal it folds
+into one line. The todo's row badges its id and counts down too (on the week
+board, its card). Paused, it turns grey and shows `⏸`. When the block is up,
+the TUI shows a banner and rings the terminal bell. Windows Terminal turns the bell into a taskbar flash. To
 get a desktop notification as well, set `$AGENTODO_TIMER_HOOK` to a shell
 command. It runs with `$AGENTODO_TODO_ID` and `$AGENTODO_TODO_TITLE` set.
 For example, a Windows toast from WSL:

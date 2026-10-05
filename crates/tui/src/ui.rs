@@ -1,13 +1,14 @@
 use agentodo_core::{
-    format_duration, format_timer, EntryKind, LogEntry, Priority, SortBy, Source, Status, Todo,
+    format_countdown, format_duration, format_timer, ActiveSession, EntryKind, LogEntry, Priority,
+    SortBy, Source, Status, Todo,
 };
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph,
-    Row, Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding,
+    Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 
@@ -17,12 +18,14 @@ use crate::line::LineEdit;
 const DIM: Style = Style::new().fg(Color::DarkGray);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, list, footer] = Layout::vertical([
+    let [header, list, player, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(player_height(app, frame.area().height)),
         Constraint::Length(1),
     ])
     .areas(frame.area());
+    draw_player(frame, app, player);
 
     if let Mode::Log { .. } = app.mode {
         draw_log_header(frame, app, header);
@@ -81,10 +84,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
     let (open, done) = app.counts();
-    let mut right = Line::from(format!(" [{open} open / {done} done] ")).right_aligned();
-    if let Some(timer) = timer_spans(app) {
-        right.spans.splice(0..0, timer);
-    }
+    let right = Line::from(format!(" [{open} open / {done} done] ")).right_aligned();
     // Give the counts their full width; the description truncates first.
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Fill(1),
@@ -182,7 +182,11 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Some(clock) => clock,
                 None => when_text(t, app.today),
             };
-            todo_row(t, title, app.changed.contains(&t.id), when, plan)
+            let timed = app
+                .timer
+                .filter(|a| a.todo == t.id)
+                .map(|a| timer_color(&a, app.now()));
+            todo_row(t, title, app.changed.contains(&t.id), when, plan, timed)
         })
         .collect();
 
@@ -246,13 +250,15 @@ fn plan_text(app: &App, t: &Todo) -> Span<'static> {
 
 /// One list row. `changed` marks a todo someone else touched since you last
 /// looked; `when` is its day, or the countdown while its timer runs; `plan`
-/// is time spent against its plan.
+/// is time spent against its plan, and `timed` the timer's colour, which
+/// badges the id so the row stands out.
 fn todo_row<'a>(
     t: &'a Todo,
     title: Line<'a>,
     changed: bool,
     when: Span<'a>,
     plan: Span<'a>,
+    timed: Option<Color>,
 ) -> Row<'a> {
     let done = t.status == Status::Done;
     let marker = if done {
@@ -283,7 +289,10 @@ fn todo_row<'a>(
     let row = Row::new(vec![
         Cell::from(change),
         Cell::from(marker),
-        Cell::from(Line::from(t.id.to_string()).right_aligned()).style(DIM),
+        Cell::from(Line::from(t.id.to_string()).right_aligned()).style(match timed {
+            Some(color) => Style::new().fg(Color::Black).bg(color).bold(),
+            None => DIM,
+        }),
         Cell::from(title),
         Cell::from(when),
         Cell::from(plan),
@@ -315,26 +324,6 @@ fn when_text(t: &Todo, today: NaiveDate) -> Span<'static> {
     }
 }
 
-/// ` ⏱ 18:42 #3 refactor store`, for the header while a timer runs.
-fn timer_spans(app: &App) -> Option<Vec<Span<'static>>> {
-    let timer = app.timer?;
-    let title = app
-        .all_todos()
-        .iter()
-        .find(|t| t.id == timer.todo)
-        .map_or(String::new(), |t| t.title.clone());
-    let short: String = if title.chars().count() > 24 {
-        title.chars().take(23).chain(['…']).collect()
-    } else {
-        title
-    };
-    Some(vec![
-        Span::raw(" ⏱ "),
-        countdown(app, timer.todo)?,
-        Span::styled(format!(" #{} {short}", timer.todo), DIM),
-    ])
-}
-
 /// `id`'s timer clock if it's the one running: time left, or `+01:12` of
 /// overtime once its block is up.
 fn countdown_text(app: &App, id: u64) -> Option<String> {
@@ -342,18 +331,176 @@ fn countdown_text(app: &App, id: u64) -> Option<String> {
     Some(format_timer(&timer, app.now()))
 }
 
-/// [`countdown_text`], green while in the block, yellow in overtime and
-/// dimmed while paused.
+/// [`countdown_text`] in the timer's colour.
 fn countdown(app: &App, id: u64) -> Option<Span<'static>> {
     let text = countdown_text(app, id)?;
-    let timer = app.timer?;
-    Some(if timer.is_paused(app.now()) {
-        Span::styled(text, DIM)
-    } else if timer.is_over(app.now()) {
-        Span::raw(text).yellow().bold()
+    let color = timer_color(&app.timer?, app.now());
+    Some(Span::styled(text, Style::new().fg(color).bold()))
+}
+
+/// Overtime past which a timer looks forgotten rather than stretched.
+const FORGOTTEN: chrono::Duration = chrono::Duration::minutes(15);
+
+/// Green while in the block, yellow in overtime, red once it looks
+/// forgotten, grey while paused.
+fn timer_color(timer: &ActiveSession, now: chrono::DateTime<chrono::Utc>) -> Color {
+    if timer.is_paused(now) {
+        Color::DarkGray
+    } else if timer.overtime(now) >= FORGOTTEN {
+        Color::Red
+    } else if timer.is_over(now) {
+        Color::Yellow
     } else {
-        Span::raw(text).green().bold()
-    })
+        Color::Green
+    }
+}
+
+// ---- player -------------------------------------------------------------------
+
+/// Widest the docked player grows; wider terminals centre it.
+const PLAYER_WIDTH: u16 = 72;
+/// Shorter screens get the one-line player so the list keeps its rows.
+const PLAYER_MIN_SCREEN: u16 = 20;
+const PLAYER_KEYS: &str = " P pause · S stop · gT jump ";
+
+/// Rows the player docks in above the footer: none without a timer, a
+/// bordered card, or a single line on a short screen.
+fn player_height(app: &App, screen: u16) -> u16 {
+    match app.timer {
+        None => 0,
+        Some(_) if screen >= PLAYER_MIN_SCREEN => 4,
+        Some(_) => 1,
+    }
+}
+
+/// The running timer, docked like a music player's now-playing bar:
+///
+/// ```text
+/// ╭ focus ───────────────────────────────────────────────────────╮
+/// │ ▶  #3 write release notes                  work · ends 09:25 │
+/// │ 06:18 ━━━━━━━━━━━━━━━──────────────────────────────── -18:42 │
+/// ╰──────────────────────────────────────────── S stop · gT jump ╯
+/// ```
+///
+/// On a short screen it folds into one line: `▶ 18:42 #3 title ━━──`.
+fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(timer) = app.timer else { return };
+    if area.height == 0 {
+        return;
+    }
+    let now = app.now();
+    let color = timer_color(&timer, now);
+    let tint = Style::new().fg(color).bold();
+    let todo = app.all_todos().iter().find(|t| t.id == timer.todo);
+    let title = todo.map_or("", |t| t.title.as_str());
+    let planned = timer.planned_secs.max(1) as f64;
+    let elapsed = timer.elapsed(now);
+    let ratio = (elapsed.num_seconds().max(0) as f64 / planned).min(1.0);
+    let paused = timer.is_paused(now);
+    // The clock already says ⏸ while paused.
+    let icon = if paused { "" } else { "▶ " };
+
+    if area.height < 4 {
+        let badge = Style::new().fg(Color::Black).bg(color).bold();
+        let mut line = Line::from(vec![
+            Span::styled(format!(" {icon}{} ", format_timer(&timer, now)), badge),
+            Span::styled(format!(" #{} ", timer.todo), DIM),
+            Span::raw(clip(title, 32)),
+            " ".into(),
+        ]);
+        let room = (area.width as usize).saturating_sub(line.width() + PLAYER_KEYS.len());
+        if room >= 8 {
+            line.spans.extend(progress(ratio, room, color));
+        }
+        line.spans.push(Span::styled(PLAYER_KEYS, DIM));
+        frame.render_widget(line, area);
+        return;
+    }
+
+    let [card] = Layout::horizontal([Constraint::Length(area.width.min(PLAYER_WIDTH))])
+        .flex(Flex::Center)
+        .areas(area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(color))
+        .title(Span::styled(" focus ", tint))
+        .title_bottom(Line::styled(PLAYER_KEYS, DIM).right_aligned())
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(card);
+    frame.render_widget(block, card);
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
+
+    // What's playing, with the project and when the block ends (or how far
+    // past it we are) on the right.
+    let clock = if timer.is_over(now) {
+        format!("+{}", format_countdown(timer.overtime(now)))
+    } else {
+        format!("-{}", format_countdown(timer.remaining(now)))
+    };
+    let mut right = Line::default().right_aligned();
+    if let Some(p) = todo
+        .and_then(|t| t.project.as_deref())
+        .filter(|p| !p.is_empty())
+    {
+        right.spans.push(Span::raw(p.to_owned()).cyan());
+        right.spans.push(Span::styled(" · ", DIM));
+    }
+    if timer.is_auto_paused(now) {
+        right
+            .spans
+            .push(Span::styled("paused itself · P resumes", tint));
+    } else if paused {
+        right.spans.push(Span::styled("paused · P resumes", tint));
+    } else if timer.is_over(now) {
+        right
+            .spans
+            .push(Span::styled(format!("{clock} over"), tint));
+    } else if let Some(ends) = timer.ends_at(now) {
+        let ends = ends.with_timezone(&Local).format("%H:%M");
+        right.spans.push(Span::styled(format!("ends {ends}"), DIM));
+    }
+    let [title_area, right_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(right.width() as u16 + 1),
+    ])
+    .areas(top);
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled(if paused { "⏸  " } else { "▶  " }, tint),
+            Span::styled(format!("#{} ", timer.todo), DIM),
+            Span::raw(title.to_owned()).bold(),
+        ]),
+        title_area,
+    );
+    frame.render_widget(right, right_area);
+
+    // Elapsed, the bar, then time left or the overtime.
+    let elapsed = format_countdown(elapsed);
+    let room = (bottom.width as usize).saturating_sub(elapsed.len() + clock.len() + 2);
+    let mut bar = vec![Span::raw(elapsed), " ".into()];
+    bar.extend(progress(ratio, room, color));
+    bar.push(" ".into());
+    bar.push(Span::styled(clock, tint));
+    frame.render_widget(Line::from(bar), bottom);
+}
+
+/// A `width`-cell bar with `ratio` of it filled in `color`.
+fn progress(ratio: f64, width: usize, color: Color) -> [Span<'static>; 2] {
+    let filled = (ratio * width as f64).round() as usize;
+    [
+        Span::styled("━".repeat(filled), Style::new().fg(color)),
+        Span::styled("─".repeat(width - filled), DIM),
+    ]
+}
+
+/// `s` cut to `max` characters, with an ellipsis when it was longer.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        s.chars().take(max - 1).chain(['…']).collect()
+    } else {
+        s.to_owned()
+    }
 }
 
 fn week_range(monday: NaiveDate) -> String {
@@ -792,10 +939,7 @@ fn draw_log_header(frame: &mut Frame, app: &App, area: Rect) {
         "change log".magenta(),
         Span::styled(format!(" · {scope}"), DIM),
     ]);
-    let mut right = Line::from(format!(" [{} changes] ", entries.len())).right_aligned();
-    if let Some(timer) = timer_spans(app) {
-        right.spans.splice(0..0, timer);
-    }
+    let right = Line::from(format!(" [{} changes] ", entries.len())).right_aligned();
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Fill(1),
         Constraint::Length(right.width() as u16),
@@ -962,6 +1106,7 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         ("e", "edit notes in $EDITOR"),
         ("T  :stop", "focus timer: start / stop"),
         ("P  :pause :resume", "pause / resume the timer"),
+        ("S  gT", "stop timer / jump to its todo"),
         ("t", "plan time (~2h when adding)"),
         ("Enter", "details · fix time (c dd a)"),
         ("p", "filter by project"),
@@ -1520,9 +1665,9 @@ mod tests {
     }
 
     #[test]
-    fn running_timer_counts_down_in_header_row_card_and_detail() {
+    fn running_timer_counts_down_in_player_row_card_and_detail() {
         let ts = TempStore::new();
-        ts.seed(&["buy milk", "refactor store"]);
+        ts.seed(&["buy milk", "refactor store +work"]);
         ts.as_agent(|s| {
             s.start_timer(2, chrono::Duration::minutes(25), nine())
                 .unwrap();
@@ -1530,15 +1675,40 @@ mod tests {
         let mut app = ts.app();
         app.set_now(nine_ish);
 
+        // A short screen folds the player into one line above the footer.
         let buf = render(&mut app, 90, 8);
         let header = row_text(&buf, 0);
-        assert!(header.contains("⏱ 18:42 #2 refactor store"), "{header}");
+        assert!(!header.contains("18:42"), "{header}");
         assert!(header.trim_end().ends_with("[2 open / 0 done]"));
-        let y = (1..8)
+        let player = row_text(&buf, 6);
+        assert!(
+            player.starts_with(" ▶ 18:42  #2 refactor store ━"),
+            "{player}"
+        );
+        assert!(player.trim_end().ends_with("S stop · gT jump"), "{player}");
+        assert_eq!(buf[(1, 6)].bg, Color::Green);
+
+        let y = (1..6)
             .find(|&y| row_text(&buf, y).contains("refactor store"))
             .unwrap();
         assert!(row_text(&buf, y).contains("18:42"));
-        assert!(!row_text(&buf, find_row(&buf, "buy milk")).contains("18:42"));
+        assert_eq!(buf[(6, y)].bg, Color::Green, "the timed id is badged");
+        let milk = find_row(&buf, "buy milk");
+        assert!(!row_text(&buf, milk).contains("18:42"));
+        assert_ne!(buf[(6, milk)].bg, Color::Green);
+
+        // A tall one docks the full card, centred.
+        let buf = render(&mut app, 90, 24);
+        let top = find_row(&buf, "╭ focus ");
+        assert_eq!(row_text(&buf, top).find('╭'), Some(9));
+        let title = row_text(&buf, top + 1);
+        assert!(title.contains("│ ▶  #2 refactor store"), "{title}");
+        assert!(title.contains("work · ends "), "{title}");
+        let bar = row_text(&buf, top + 2);
+        assert!(bar.contains("│ 06:18 ━━━━━"), "{bar}");
+        assert!(bar.contains("─ -18:42 │"), "{bar}");
+        assert!(row_text(&buf, top + 3).contains("S stop · gT jump ╯"));
+        assert_eq!(top + 4, 23, "docked right above the footer");
 
         press(&mut app, "W");
         let buf = render(&mut app, 120, 10);
@@ -1549,6 +1719,51 @@ mod tests {
         let buf = render(&mut app, 90, 30);
         assert!(row_text(&buf, find_row(&buf, "timer")).contains("18:42"));
         find_row(&buf, "no time recorded");
+    }
+
+    fn much_later() -> chrono::DateTime<chrono::Utc> {
+        nine() + chrono::Duration::hours(30)
+    }
+
+    #[test]
+    fn a_paused_timer_greys_the_player_and_says_how_to_resume() {
+        let ts = TempStore::new();
+        ts.seed(&["refactor store +work"]);
+        ts.as_agent(|s| {
+            s.start_timer(1, chrono::Duration::minutes(25), nine())
+                .unwrap();
+            s.pause_timer(nine_ish());
+        });
+        let mut app = ts.app();
+        app.set_now(much_later);
+
+        let buf = render(&mut app, 90, 8);
+        let player = row_text(&buf, 6);
+        assert!(
+            player.starts_with(" ⏸ 18:42  #1 refactor store"),
+            "{player}"
+        );
+        assert_eq!(buf[(1, 6)].bg, Color::DarkGray);
+
+        let buf = render(&mut app, 90, 24);
+        let top = find_row(&buf, "╭ focus ");
+        let title = row_text(&buf, top + 1);
+        assert!(title.contains("│ ⏸  #1 refactor store"), "{title}");
+        assert!(title.contains("work · paused · P resumes"), "{title}");
+        assert!(row_text(&buf, top + 2).contains("│ 06:18 ━"));
+
+        // Left running instead, it pauses itself and says so.
+        ts.as_agent(|s| {
+            s.set_max_overtime(Some(chrono::Duration::hours(1)));
+            s.start_timer(1, chrono::Duration::minutes(25), nine())
+                .unwrap();
+        });
+        app.refresh_if_changed();
+        let buf = render(&mut app, 90, 24);
+        let top = find_row(&buf, "╭ focus ");
+        let title = row_text(&buf, top + 1);
+        assert!(title.contains("paused itself · P resumes"), "{title}");
+        assert!(row_text(&buf, top + 2).contains("+1:00:00 │"));
     }
 
     fn overtime_now() -> chrono::DateTime<chrono::Utc> {
@@ -1580,10 +1795,23 @@ mod tests {
         app.set_now(overtime_now);
 
         let buf = render(&mut app, 90, 8);
-        assert!(row_text(&buf, 0).contains("⏱ +01:12 #1"));
-        let x = row_text(&buf, 0).find("+01:12").unwrap();
-        let x = row_text(&buf, 0)[..x].chars().count() as u16;
-        assert_eq!(buf[(x, 0)].fg, Color::Yellow);
+        assert!(row_text(&buf, 6).starts_with(" ▶ +01:12  #1"));
+        assert_eq!(buf[(1, 6)].bg, Color::Yellow);
+
+        let buf = render(&mut app, 90, 24);
+        let top = find_row(&buf, "╭ focus ");
+        assert_eq!(buf[(9, top)].fg, Color::Yellow);
+        assert!(row_text(&buf, top + 1).contains("+01:12 over │"));
+        let bar = row_text(&buf, top + 2);
+        assert!(bar.contains("│ 26:12 ━━━━"), "{bar}");
+        assert!(bar.contains("━ +01:12 │"), "a full bar: {bar}");
+        assert!(!bar.contains('─'), "{bar}");
+
+        // Far enough over and it looks forgotten.
+        app.set_now(|| nine() + chrono::Duration::minutes(25 + 15));
+        let buf = render(&mut app, 90, 24);
+        assert_eq!(buf[(9, find_row(&buf, "╭ focus "))].fg, Color::Red);
+        app.set_now(overtime_now);
 
         press(&mut app, "<CR>");
         let buf = render(&mut app, 90, 40);

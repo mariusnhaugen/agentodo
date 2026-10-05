@@ -497,6 +497,14 @@ impl App {
         });
     }
 
+    /// `gT`: back to the todo the timer runs on, widening filters if needed.
+    fn goto_timer(&mut self) {
+        match self.timer {
+            Some(t) => self.goto_todo(t.todo),
+            None => self.info("no timer running"),
+        }
+    }
+
     fn start_timer(&mut self, id: u64, text: &str) {
         let Some(length) = parse_duration(text) else {
             return self.error(format!("not a duration: {text:?} (try 25, 50m, 1h30m)"));
@@ -947,6 +955,10 @@ impl App {
                     self.schedule_current(Some(self.today));
                     Effect::None
                 }
+                ('g', KeyCode::Char('T')) => {
+                    self.goto_timer();
+                    Effect::None
+                }
                 ('g', KeyCode::Char('w')) => {
                     if self.current().is_some() {
                         self.pending.op = Some(DAY_PICK);
@@ -1038,6 +1050,7 @@ impl App {
             KeyCode::Char('t') => {
                 self.start_input_on_current(|t| (InputKind::Plan(t.id), LineEdit::default()))
             }
+            KeyCode::Char('S') => self.stop_timer(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.bump_priority(true),
             KeyCode::Char('-') => self.bump_priority(false),
             KeyCode::Char('e') => {
@@ -2742,6 +2755,34 @@ pub(crate) mod tests {
         press(&mut app, "T");
         assert_eq!(spent(&ts, 1), 75);
         assert!(app.message.as_ref().unwrap().text.contains("after 1h15m"));
+    }
+
+    #[test]
+    fn g_t_jumps_to_the_timed_todo_and_s_stops_it_from_anywhere() {
+        let ts = TempStore::new();
+        ts.seed(&["a +work", "b +home"]);
+        let mut app = ts.app();
+        app.set_now(t0);
+        press(&mut app, "gT");
+        assert_eq!(app.message.as_ref().unwrap().text, "no timer running");
+
+        ts.as_agent(|s| {
+            s.start_timer(1, chrono::Duration::minutes(25), t0())
+                .unwrap();
+        });
+        app.refresh_if_changed();
+        press(&mut app, ":project home<CR>");
+        assert_eq!(app.current().unwrap().id, 2);
+
+        press(&mut app, "gT");
+        assert_eq!(app.current().unwrap().id, 1, "gT widens the filter");
+        assert_eq!(app.project, ProjectFilter::All);
+
+        app.set_now(t10);
+        press(&mut app, "ggS");
+        assert_eq!(app.current().unwrap().id, 2);
+        assert_eq!(app.timer, None);
+        assert!(app.message.as_ref().unwrap().text.contains("stopped #1"));
     }
 
     #[test]
