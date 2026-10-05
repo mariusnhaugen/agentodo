@@ -6,6 +6,9 @@ pub enum Error {
     #[error("no todo found with id {0}")]
     NotFound(u64),
 
+    #[error("todo {id} has no session {index}")]
+    NoSession { id: u64, index: usize },
+
     #[error("a todo with id {0} already exists")]
     IdTaken(u64),
 

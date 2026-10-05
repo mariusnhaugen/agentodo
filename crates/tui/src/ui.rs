@@ -1,4 +1,6 @@
-use agentodo_core::{EntryKind, LogEntry, Priority, SortBy, Source, Status, Todo};
+use agentodo_core::{
+    format_duration, format_timer, EntryKind, LogEntry, Priority, SortBy, Source, Status, Todo,
+};
 use chrono::{Datelike, Local, NaiveDate};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -39,7 +41,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     match &app.mode {
         Mode::Help => draw_help(frame),
-        Mode::Detail => draw_detail(frame, app),
+        Mode::Detail { id, selected } => draw_detail(frame, app, *id, *selected),
+        Mode::Input {
+            kind: InputKind::SessionLength { id, index },
+            ..
+        } => {
+            let count = app
+                .all_todos()
+                .iter()
+                .find(|t| t.id == *id)
+                .map_or(0, |t| t.sessions.len());
+            draw_detail(frame, app, *id, count.saturating_sub(index + 1))
+        }
+        Mode::Input {
+            kind: InputKind::AddSession(id),
+            ..
+        } => draw_detail(frame, app, *id, 0),
         Mode::Picker { .. } => draw_picker(frame, app),
         _ => {}
     }
@@ -64,7 +81,10 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
     let (open, done) = app.counts();
-    let right = Line::from(format!(" [{open} open / {done} done] ")).right_aligned();
+    let mut right = Line::from(format!(" [{open} open / {done} done] ")).right_aligned();
+    if let Some(timer) = timer_spans(app) {
+        right.spans.splice(0..0, timer);
+    }
     // Give the counts their full width; the description truncates first.
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Fill(1),
@@ -136,7 +156,10 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(1)
         .max(3) as u16;
 
-    let when_width = if app.rows.iter().any(|t| t.scheduled.is_some()) {
+    let timed = app
+        .timer
+        .is_some_and(|a| app.rows.iter().any(|t| t.id == a.todo));
+    let when_width = if timed || app.rows.iter().any(|t| t.scheduled.is_some()) {
         6
     } else {
         0
@@ -151,7 +174,11 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Some((id, line)) if id == t.id => input_line(line),
                 _ => title_line(t, search),
             };
-            todo_row(t, title, app.changed.contains(&t.id), app.today)
+            let when = match countdown(app, t.id) {
+                Some(clock) => clock,
+                None => when_text(t, app.today),
+            };
+            todo_row(t, title, app.changed.contains(&t.id), when)
         })
         .collect();
 
@@ -197,8 +224,8 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// One list row. `changed` marks a todo someone else touched since you last
-/// looked.
-fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool, today: NaiveDate) -> Row<'a> {
+/// looked; `when` is its day, or the countdown while its timer runs.
+fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool, when: Span<'a>) -> Row<'a> {
     let done = t.status == Status::Done;
     let marker = if done {
         Span::raw("✓")
@@ -230,7 +257,7 @@ fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool, today: NaiveDate) -
         Cell::from(marker),
         Cell::from(Line::from(t.id.to_string()).right_aligned()).style(DIM),
         Cell::from(title),
-        Cell::from(when_text(t, today)),
+        Cell::from(when),
         Cell::from(project),
         Cell::from(tags),
     ]);
@@ -257,6 +284,44 @@ fn when_text(t: &Todo, today: NaiveDate) -> Span<'static> {
     } else {
         Span::raw(text).blue()
     }
+}
+
+/// ` ⏱ 18:42 #3 refactor store`, for the header while a timer runs.
+fn timer_spans(app: &App) -> Option<Vec<Span<'static>>> {
+    let timer = app.timer?;
+    let title = app
+        .all_todos()
+        .iter()
+        .find(|t| t.id == timer.todo)
+        .map_or(String::new(), |t| t.title.clone());
+    let short: String = if title.chars().count() > 24 {
+        title.chars().take(23).chain(['…']).collect()
+    } else {
+        title
+    };
+    Some(vec![
+        Span::raw(" ⏱ "),
+        countdown(app, timer.todo)?,
+        Span::styled(format!(" #{} {short}", timer.todo), DIM),
+    ])
+}
+
+/// `id`'s timer clock if it's the one running: time left, or `+01:12` of
+/// overtime once its block is up.
+fn countdown_text(app: &App, id: u64) -> Option<String> {
+    let timer = app.timer.filter(|t| t.todo == id)?;
+    Some(format_timer(&timer, app.now()))
+}
+
+/// [`countdown_text`], green while in the block and yellow in overtime.
+fn countdown(app: &App, id: u64) -> Option<Span<'static>> {
+    let text = countdown_text(app, id)?;
+    let over = app.timer.is_some_and(|t| t.is_over(app.now()));
+    Some(if over {
+        Span::raw(text).yellow().bold()
+    } else {
+        Span::raw(text).green().bold()
+    })
 }
 
 fn week_range(monday: NaiveDate) -> String {
@@ -329,7 +394,14 @@ fn draw_column(frame: &mut Frame, app: &App, col: usize, area: Rect) {
         .enumerate()
         .map(|(i, card)| {
             let selected = cursor == Some(i) && !adding;
-            card_lines(card, width, selected, app.changed.contains(&card.todo.id))
+            let timer = countdown_text(app, card.todo.id);
+            card_lines(
+                card,
+                width,
+                selected,
+                app.changed.contains(&card.todo.id),
+                timer,
+            )
         })
         .collect();
 
@@ -368,9 +440,15 @@ fn draw_column(frame: &mut Frame, app: &App, col: usize, area: Rect) {
     frame.render_widget(Paragraph::new(lines), body);
 }
 
-/// A card: a marker column (`•` changed, `!` high, `✓` done), then the title
-/// and slip count wrapped to at most [`CARD_LINES`] lines.
-fn card_lines(card: &Card, width: usize, selected: bool, changed: bool) -> Vec<Line<'static>> {
+/// A card: a marker column (`•` changed, `!` high, `✓` done), then the title,
+/// slip count and running timer wrapped to at most [`CARD_LINES`] lines.
+fn card_lines(
+    card: &Card,
+    width: usize,
+    selected: bool,
+    changed: bool,
+    timer: Option<String>,
+) -> Vec<Line<'static>> {
     let t = &card.todo;
     let done = t.status == Status::Done;
     let marker = if changed {
@@ -395,6 +473,9 @@ fn card_lines(card: &Card, width: usize, selected: bool, changed: bool) -> Vec<L
     let mut text = t.title.clone();
     if card.slipped > 0 {
         text.push_str(&format!(" ↻{}", card.slipped));
+    }
+    if let Some(left) = timer {
+        text.push_str(&format!(" [{left}]"));
     }
     wrap(&text, width.max(1), CARD_LINES)
         .into_iter()
@@ -562,10 +643,21 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             InputKind::Command => Some(":"),
             InputKind::Search { .. } => Some("/"),
             InputKind::SetProject(_) => Some("project: "),
+            InputKind::TimerLength(_) => Some("focus for (minutes, or 50m / 1h30m): "),
+            InputKind::AddSession(_) => Some("add time worked, ending now (34, 1h30m): "),
             _ => None,
         };
-        if let Some(prompt) = prompt {
-            let mut spans = vec![Span::raw(prompt)];
+        let length_prompt = match kind {
+            InputKind::SessionLength { id, index } => app
+                .all_todos()
+                .iter()
+                .find(|t| t.id == *id)
+                .and_then(|t| t.sessions.get(*index))
+                .map(|s| format!("length (now {}): ", format_duration(s.duration()))),
+            _ => None,
+        };
+        if let Some(prompt) = length_prompt.as_deref().or(prompt) {
+            let mut spans = vec![Span::raw(prompt.to_owned())];
             spans.extend(input_line(line).spans);
             frame.render_widget(Line::from(spans), area);
             return;
@@ -631,7 +723,10 @@ fn draw_log_header(frame: &mut Frame, app: &App, area: Rect) {
         "change log".magenta(),
         Span::styled(format!(" · {scope}"), DIM),
     ]);
-    let right = Line::from(format!(" [{} changes] ", entries.len())).right_aligned();
+    let mut right = Line::from(format!(" [{} changes] ", entries.len())).right_aligned();
+    if let Some(timer) = timer_spans(app) {
+        right.spans.splice(0..0, timer);
+    }
     let [left_area, right_area] = Layout::horizontal([
         Constraint::Fill(1),
         Constraint::Length(right.width() as u16),
@@ -796,7 +891,8 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         ("+ -", "raise / lower priority"),
         ("gp", "set project"),
         ("e", "edit notes in $EDITOR"),
-        ("Enter", "show details"),
+        ("T  :stop", "focus timer: start / stop"),
+        ("Enter", "details · fix time (c dd a)"),
         ("p", "filter by project"),
         (".", "show / hide done"),
         ("s", "sort priority / created"),
@@ -897,8 +993,13 @@ fn draw_help(frame: &mut Frame) {
     }
 }
 
-fn draw_detail(frame: &mut Frame, app: &App) {
-    let Some(t) = app.current() else { return };
+/// Sessions listed at once in the detail view; the rest scroll into view.
+const DETAIL_SESSIONS: usize = 10;
+
+fn draw_detail(frame: &mut Frame, app: &App, id: u64, selected: usize) {
+    let Some(t) = app.all_todos().iter().find(|t| t.id == id) else {
+        return;
+    };
     let field = |name: &'static str, value: String| {
         Line::from(vec![
             Span::styled(format!("{name:>10}  "), DIM),
@@ -935,17 +1036,97 @@ fn draw_detail(frame: &mut Frame, app: &App) {
             done.format("%Y-%m-%d %H:%M UTC").to_string(),
         ));
     }
+    if let Some(clock) = countdown(app, t.id) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>10}  ", "timer"), DIM),
+            clock,
+        ]));
+    }
+    lines.push(field("time", time_summary(t)));
+    lines.push(Line::default());
+    lines.extend(session_lines(t, selected));
     lines.push(Line::default());
     match t.notes.as_deref() {
         Some(notes) => lines.extend(Text::from(notes).lines),
         None => lines.push(Line::styled("no notes — press e to write some", DIM)),
     }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "j/k session · c change · dd delete · a add · u undo · e notes · q close",
+        DIM,
+    ));
 
     let area = frame.area();
     let width = area.width.saturating_sub(8).min(80);
     let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let inner = popup(frame, width, height, "todo");
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// `1h12m over 3 sessions`, or `—`.
+fn time_summary(t: &Todo) -> String {
+    match t.sessions.len() {
+        0 => "—".into(),
+        n => format!(
+            "{} over {n} session{}",
+            format_duration(t.time_spent()),
+            if n == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+/// Sessions newest first, [`DETAIL_SESSIONS`] at a time around the
+/// selected one, overtime called out so a forgotten timer stands out.
+fn session_lines(t: &Todo, selected: usize) -> Vec<Line<'static>> {
+    let total = t.sessions.len();
+    if total == 0 {
+        return vec![Line::styled(
+            "  no time recorded — T starts a timer, a adds time",
+            DIM,
+        )];
+    }
+    let first = selected.saturating_sub(DETAIL_SESSIONS - 1);
+    let mut lines = vec![Line::from("  sessions".bold())];
+    if first > 0 {
+        lines.push(Line::styled(format!("    ↑ {first} newer"), DIM));
+    }
+    for (i, s) in t
+        .sessions
+        .iter()
+        .rev()
+        .enumerate()
+        .skip(first)
+        .take(DETAIL_SESSIONS)
+    {
+        let (start, end) = (s.start.with_timezone(&Local), s.end.with_timezone(&Local));
+        let mut spans = vec![
+            Span::raw(if i == selected { "  ▶ " } else { "    " }),
+            Span::raw(format!(
+                "{}  {}–{}  {:>6}",
+                start.format("%a %-d %b"),
+                start.format("%H:%M"),
+                end.format("%H:%M"),
+                format_duration(s.duration())
+            )),
+        ];
+        if let Some(over) = s.overtime() {
+            spans.push(Span::raw(format!("  +{} over", format_duration(over))).yellow());
+        }
+        let line = Line::from(spans);
+        lines.push(if i == selected {
+            line.add_modifier(Modifier::REVERSED)
+        } else {
+            line
+        });
+    }
+    let shown_to = (first + DETAIL_SESSIONS).min(total);
+    if shown_to < total {
+        lines.push(Line::styled(
+            format!("    +{} earlier", total - shown_to),
+            DIM,
+        ));
+    }
+    lines
 }
 
 fn draw_picker(frame: &mut Frame, app: &App) {
@@ -1142,6 +1323,10 @@ mod tests {
             "ship release !h +work #urgent #release",
             "answer email +work",
         ]);
+        ts.as_agent(|s| {
+            s.start_timer(4, chrono::Duration::minutes(25), chrono::Utc::now())
+                .unwrap();
+        });
         let mut app = ts.app();
         press(&mut app, "Gx/re<CR>");
         let buf = render(&mut app, 72, 10);
@@ -1229,5 +1414,92 @@ mod tests {
         let buf = render(&mut app, 120, 10);
         let last = &app.current().unwrap().title.clone();
         find_row(&buf, last);
+    }
+
+    fn nine() -> chrono::DateTime<chrono::Utc> {
+        "2026-10-05T09:00:00Z".parse().unwrap()
+    }
+
+    fn nine_ish() -> chrono::DateTime<chrono::Utc> {
+        nine() + chrono::Duration::seconds(6 * 60 + 18)
+    }
+
+    #[test]
+    fn running_timer_counts_down_in_header_row_card_and_detail() {
+        let ts = TempStore::new();
+        ts.seed(&["buy milk", "refactor store"]);
+        ts.as_agent(|s| {
+            s.start_timer(2, chrono::Duration::minutes(25), nine())
+                .unwrap();
+        });
+        let mut app = ts.app();
+        app.set_now(nine_ish);
+
+        let buf = render(&mut app, 90, 8);
+        let header = row_text(&buf, 0);
+        assert!(header.contains("⏱ 18:42 #2 refactor store"), "{header}");
+        assert!(header.trim_end().ends_with("[2 open / 0 done]"));
+        let y = (1..8)
+            .find(|&y| row_text(&buf, y).contains("refactor store"))
+            .unwrap();
+        assert!(row_text(&buf, y).contains("18:42"));
+        assert!(!row_text(&buf, find_row(&buf, "buy milk")).contains("18:42"));
+
+        press(&mut app, "W");
+        let buf = render(&mut app, 120, 10);
+        find_row(&buf, "[18:42]");
+
+        press(&mut app, "W");
+        press(&mut app, "/refactor<CR><CR>");
+        let buf = render(&mut app, 90, 30);
+        assert!(row_text(&buf, find_row(&buf, "timer")).contains("18:42"));
+        find_row(&buf, "no time recorded");
+    }
+
+    fn overtime_now() -> chrono::DateTime<chrono::Utc> {
+        nine() + chrono::Duration::seconds(25 * 60 + 72)
+    }
+
+    #[test]
+    fn overtime_counts_up_and_sessions_list_newest_first() {
+        let ts = TempStore::new();
+        ts.seed(&["refactor store"]);
+        ts.as_agent(|s| {
+            for _ in 0..12 {
+                s.add_session(1, chrono::Duration::minutes(5), nine())
+                    .unwrap();
+            }
+            s.start_timer(
+                1,
+                chrono::Duration::minutes(25),
+                nine() - chrono::Duration::hours(10),
+            )
+            .unwrap();
+            s.stop_timer(nine() - chrono::Duration::minutes(35))
+                .unwrap();
+            s.start_timer(1, chrono::Duration::minutes(25), nine())
+                .unwrap();
+        });
+        let mut app = ts.app();
+        app.set_now(overtime_now);
+
+        let buf = render(&mut app, 90, 8);
+        assert!(row_text(&buf, 0).contains("⏱ +01:12 #1"));
+        let x = row_text(&buf, 0).find("+01:12").unwrap();
+        let x = row_text(&buf, 0)[..x].chars().count() as u16;
+        assert_eq!(buf[(x, 0)].fg, Color::Yellow);
+
+        press(&mut app, "<CR>");
+        let buf = render(&mut app, 90, 40);
+        assert!(row_text(&buf, find_row(&buf, "time ")).contains("10h25m over 13 sessions"));
+        let newest = find_row(&buf, "  ▶ ");
+        assert!(row_text(&buf, newest).contains("9h25m  +9h over"));
+        assert!(row_text(&buf, newest + 1).contains("5m"));
+        find_row(&buf, "+3 earlier");
+
+        press(&mut app, "c");
+        let buf = render(&mut app, 90, 40);
+        assert!(row_text(&buf, 39).starts_with("length (now 9h25m): "));
+        find_row(&buf, "sessions");
     }
 }

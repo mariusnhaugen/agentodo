@@ -10,10 +10,10 @@ mod ui;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use agentodo_core::Store;
+use agentodo_core::{Store, Todo};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -88,6 +88,36 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             app.refresh_if_changed();
             last_poll = Instant::now();
         }
+        if let Some(todo) = app.tick() {
+            alert(&todo);
+        }
+    }
+}
+
+/// The focus timer ran out: ring the terminal bell (Windows Terminal flashes
+/// the taskbar) and run `$AGENTODO_TIMER_HOOK`, if set, in the background.
+fn alert(todo: &Todo) {
+    let mut out = io::stdout();
+    out.write_all(b"\x07").and_then(|_| out.flush()).ok();
+
+    let Some(hook) = std::env::var("AGENTODO_TIMER_HOOK")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+    else {
+        return;
+    };
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(hook)
+        .env("AGENTODO_TODO_ID", todo.id.to_string())
+        .env("AGENTODO_TODO_TITLE", &todo.title)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    // Reap it off-thread so a slow hook never stalls the UI.
+    if let Ok(mut child) = child {
+        std::thread::spawn(move || child.wait());
     }
 }
 

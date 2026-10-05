@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 /// How urgent a todo is. Ordered so `High > Medium > Low` for sorting.
@@ -41,6 +41,80 @@ pub struct Todo {
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Finished focus sessions, oldest first. Snapshot restores (undo,
+    /// revert) keep whatever sessions the todo has by then; sessions change
+    /// only through the store's session methods.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<Session>,
+}
+
+impl Todo {
+    /// Total time across finished sessions.
+    pub fn time_spent(&self) -> Duration {
+        self.sessions.iter().map(Session::duration).sum()
+    }
+}
+
+/// One finished stretch of work on a todo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    /// The block the timer was started for; `None` for time added by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_secs: Option<u64>,
+}
+
+impl Session {
+    pub fn duration(&self) -> Duration {
+        self.end - self.start
+    }
+
+    /// How far it ran past its planned block, if it did.
+    pub fn overtime(&self) -> Option<Duration> {
+        let planned = Duration::seconds(self.planned_secs? as i64);
+        Some(self.duration() - planned).filter(|over| *over > Duration::zero())
+    }
+}
+
+/// The running focus timer. There is at most one, stored beside the todos so
+/// every frontend sees it; the countdown is derived from the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub todo: u64,
+    pub started_at: DateTime<Utc>,
+    pub planned_secs: u64,
+}
+
+impl ActiveSession {
+    /// When the planned block is up. The timer keeps running past it,
+    /// counting overtime, until it is stopped.
+    pub fn ends_at(&self) -> DateTime<Utc> {
+        self.started_at + Duration::seconds(self.planned_secs as i64)
+    }
+
+    /// Time left in the block at `now`, never negative.
+    pub fn remaining(&self, now: DateTime<Utc>) -> Duration {
+        (self.ends_at() - now).max(Duration::zero())
+    }
+
+    /// Time past the block at `now`, never negative.
+    pub fn overtime(&self, now: DateTime<Utc>) -> Duration {
+        (now - self.ends_at()).max(Duration::zero())
+    }
+
+    pub fn is_over(&self, now: DateTime<Utc>) -> bool {
+        now >= self.ends_at()
+    }
+
+    /// The session as recorded if it stops at `now`, overtime included.
+    pub fn close_at(&self, now: DateTime<Utc>) -> Session {
+        Session {
+            start: self.started_at,
+            end: now.max(self.started_at),
+            planned_secs: Some(self.planned_secs),
+        }
+    }
 }
 
 /// Fields supplied when creating a new todo. The store fills in `id` and

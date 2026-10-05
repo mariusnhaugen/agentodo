@@ -8,8 +8,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use agentodo_core::{
-    log_path, parse_quick_add, read_log, read_log_from, week_start, EntryKind, Filter, LogEntry,
-    NewTodo, Priority, ProjectSummary, SortBy, Source, Status, Store, Todo, TodoPatch,
+    default_timer, format_duration, log_path, parse_duration, parse_quick_add, read_log,
+    read_log_from, week_start, ActiveSession, EntryKind, Filter, LogEntry, NewTodo, Priority,
+    ProjectSummary, Session, SortBy, Source, Status, Store, Todo, TodoPatch,
 };
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -49,7 +50,12 @@ pub enum Mode {
         others_only: bool,
     },
     Help,
-    Detail,
+    /// `Enter`: one todo in full, with its sessions. `selected` counts from
+    /// the newest session.
+    Detail {
+        id: u64,
+        selected: usize,
+    },
 }
 
 /// What a line of typed input is for.
@@ -65,6 +71,13 @@ pub enum InputKind {
     Command,
     /// `/`, remembering where the cursor started so Esc can return there.
     Search { origin: usize },
+    /// `T`: how long to focus on a todo.
+    TimerLength(u64),
+    /// `c` in the detail view: a new length for session `index` (oldest
+    /// first) of todo `id`.
+    SessionLength { id: u64, index: usize },
+    /// `a` in the detail view: time worked without the timer.
+    AddSession(u64),
 }
 
 /// Which screen normal mode is on. Overlays (help, log, picker…) work over
@@ -122,7 +135,16 @@ impl ProjectFilter {
 enum Change {
     Created(Todo),
     Deleted(Todo),
-    Updated { before: Todo, after: Todo },
+    Updated {
+        before: Todo,
+        after: Todo,
+    },
+    /// Session edits, which snapshot restores leave alone.
+    Sessions {
+        id: u64,
+        before: Vec<Session>,
+        after: Vec<Session>,
+    },
 }
 
 impl Change {
@@ -130,6 +152,7 @@ impl Change {
         match self {
             Change::Created(t) | Change::Deleted(t) => t.id,
             Change::Updated { before, .. } => before.id,
+            Change::Sessions { id, .. } => *id,
         }
     }
 
@@ -138,6 +161,9 @@ impl Change {
             Change::Created(t) => store.delete(t.id).map(drop),
             Change::Deleted(t) => store.restore(t.clone()).map(drop),
             Change::Updated { before, .. } => store.replace(before.clone()).map(drop),
+            Change::Sessions { id, before, .. } => {
+                store.set_sessions(*id, before.clone()).map(drop)
+            }
         }
     }
 
@@ -146,6 +172,7 @@ impl Change {
             Change::Created(t) => store.restore(t.clone()).map(drop),
             Change::Deleted(t) => store.delete(t.id).map(drop),
             Change::Updated { after, .. } => store.replace(after.clone()).map(drop),
+            Change::Sessions { id, after, .. } => store.set_sessions(*id, after.clone()).map(drop),
         }
     }
 }
@@ -215,7 +242,16 @@ pub struct App {
     /// Today's date, refreshed on every reload so the board follows midnight.
     pub today: NaiveDate,
     clock: fn() -> NaiveDate,
+    /// The running focus timer as of the last load.
+    pub timer: Option<ActiveSession>,
+    /// The timer whose end-of-block bell has gone, so it rings only once.
+    rung: Option<ActiveSession>,
+    now: fn() -> DateTime<Utc>,
 }
+
+/// A block that ended longer ago than this when the TUI first saw it (it
+/// was closed, say) doesn't ring; the header already shows the overtime.
+const STALE_ALERT: chrono::Duration = chrono::Duration::minutes(1);
 
 fn local_today() -> NaiveDate {
     Local::now().date_naive()
@@ -253,10 +289,18 @@ impl App {
             col: 0,
             today: local_today(),
             clock: local_today,
+            timer: None,
+            rung: None,
+            now: Utc::now,
         };
         let store = app.repo.load()?;
         app.absorb(store);
         Ok(app)
+    }
+
+    /// Every todo in the store as of the last load, unfiltered.
+    pub fn all_todos(&self) -> &[Todo] {
+        &self.all
     }
 
     /// The todo under the cursor, if any.
@@ -291,6 +335,7 @@ impl App {
         self.today = (self.clock)();
         self.projects = store.projects();
         self.all = store.all().to_vec();
+        self.timer = store.active_timer().copied();
         self.read_new_log_entries();
         self.rebuild_rows();
     }
@@ -356,6 +401,239 @@ impl App {
             self.place(id);
         }
         self.rebuild_rows();
+    }
+
+    // ---- focus timer ----------------------------------------------------------
+
+    pub fn now(&self) -> DateTime<Utc> {
+        (self.now)()
+    }
+
+    /// Pins the wall clock the timer runs on.
+    #[cfg(test)]
+    pub fn set_now(&mut self, now: fn() -> DateTime<Utc>) {
+        self.now = now;
+    }
+
+    /// Notices the timer's planned block running out. Called every loop
+    /// turn; returns the todo once per timer, when the caller should ring.
+    /// The timer itself keeps running, counting overtime, until stopped.
+    pub fn tick(&mut self) -> Option<Todo> {
+        let now = self.now();
+        let timer = self.timer.filter(|t| t.is_over(now))?;
+        if self.rung == Some(timer) {
+            return None;
+        }
+        self.rung = Some(timer);
+        if now - timer.ends_at() >= STALE_ALERT {
+            return None;
+        }
+        let todo = self.all.iter().find(|t| t.id == timer.todo)?.clone();
+        self.info(format!(
+            "⏱ {} up on #{} {} — counting overtime · T stops",
+            format_duration(timer.ends_at() - timer.started_at),
+            todo.id,
+            todo.title
+        ));
+        Some(todo)
+    }
+
+    /// `T`: stop the timer if it's on this todo, else ask how long to start
+    /// one for.
+    fn timer_key(&mut self) {
+        let Some(t) = self.current() else { return };
+        let id = t.id;
+        if self.timer.is_some_and(|a| a.todo == id) {
+            return self.stop_timer();
+        }
+        if t.status == Status::Done {
+            return self.error(format!("#{id} is done"));
+        }
+        let minutes = default_timer().num_minutes().to_string();
+        self.mode = Mode::Input {
+            kind: InputKind::TimerLength(id),
+            line: LineEdit::new(minutes),
+        };
+    }
+
+    fn start_timer(&mut self, id: u64, text: &str) {
+        let Some(length) = parse_duration(text) else {
+            return self.error(format!("not a duration: {text:?} (try 25, 50m, 1h30m)"));
+        };
+        let now = self.now();
+        let result = self.repo.with_store(|s| {
+            let stopped = s.stop_timer(now);
+            s.start_timer(id, length, now)?;
+            Ok(stopped)
+        });
+        self.reload();
+        match result {
+            Ok(stopped) => {
+                let mut text = format!("⏱ {} on #{id}", format_duration(length));
+                if let Some(prev) = stopped.filter(|p| p.id != id) {
+                    let spent = prev
+                        .sessions
+                        .last()
+                        .map(|s| s.duration())
+                        .unwrap_or_default();
+                    text.push_str(&format!(
+                        " · stopped #{} after {}",
+                        prev.id,
+                        format_duration(spent)
+                    ));
+                }
+                self.info(text);
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    fn stop_timer(&mut self) {
+        let now = self.now();
+        let result = self.repo.with_store(|s| Ok(s.stop_timer(now)));
+        self.reload();
+        match result {
+            Ok(Some(todo)) => {
+                let last = todo.sessions.last();
+                let spent = last.map(|s| s.duration()).unwrap_or_default();
+                let over = last
+                    .and_then(Session::overtime)
+                    .map(|o| format!(", {} over", format_duration(o)))
+                    .unwrap_or_default();
+                self.info(format!(
+                    "stopped #{} after {}{over} ({} total) · Enter to fix",
+                    todo.id,
+                    format_duration(spent),
+                    format_duration(todo.time_spent())
+                ));
+            }
+            Ok(None) => self.info("no timer running"),
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// Applies a session edit to todo `id`, recording it for undo, and
+    /// returns to its detail view with `selected` on the session shown.
+    fn edit_sessions(
+        &mut self,
+        id: u64,
+        selected: usize,
+        f: impl FnOnce(&mut Store) -> agentodo_core::Result<Todo>,
+    ) {
+        let result = self.repo.with_store(|s| {
+            let before = s
+                .get(id)
+                .map(|t| t.sessions.clone())
+                .ok_or(agentodo_core::Error::NotFound(id))?;
+            let after = f(s)?.sessions;
+            Ok((before, after))
+        });
+        match result {
+            Ok((before, after)) => self.record(vec![Change::Sessions { id, before, after }]),
+            Err(e) => self.error(format!("{e:#}")),
+        }
+        self.reload();
+        let count = self.todo(id).map_or(0, |t| t.sessions.len());
+        self.mode = Mode::Detail {
+            id,
+            selected: selected.min(count.saturating_sub(1)),
+        };
+    }
+
+    fn todo(&self, id: u64) -> Option<&Todo> {
+        self.all.iter().find(|t| t.id == id)
+    }
+
+    /// Keys in the detail view: move between sessions and fix them. Any
+    /// other key closes it, as it always has.
+    fn detail_key(&mut self, key: KeyEvent) -> Effect {
+        let Mode::Detail { id, selected } = self.mode else {
+            return Effect::None;
+        };
+        self.message = None;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let count = self.todo(id).map_or(0, |t| t.sessions.len());
+        // Sessions are stored oldest first but listed newest first.
+        let index = count.checked_sub(selected + 1);
+        let pending_d = self.pending.op.take() == Some('d');
+        let stay = |selected| Mode::Detail { id, selected };
+
+        match key.code {
+            KeyCode::Char('r') if ctrl => self.redo(),
+            _ if ctrl => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.mode = stay((selected + 1).min(count.saturating_sub(1)))
+            }
+            KeyCode::Char('k') | KeyCode::Up => self.mode = stay(selected.saturating_sub(1)),
+            KeyCode::Char('g') => self.mode = stay(0),
+            KeyCode::Char('G') => self.mode = stay(count.saturating_sub(1)),
+            KeyCode::Char('c') => match index {
+                Some(index) => {
+                    self.mode = Mode::Input {
+                        kind: InputKind::SessionLength { id, index },
+                        line: LineEdit::default(),
+                    }
+                }
+                None => self.info("no time recorded yet — a adds some"),
+            },
+            KeyCode::Char('a') => {
+                self.mode = Mode::Input {
+                    kind: InputKind::AddSession(id),
+                    line: LineEdit::default(),
+                }
+            }
+            KeyCode::Char('d') if pending_d => {
+                if let Some(index) = index {
+                    self.edit_sessions(id, selected, |s| s.delete_session(id, index));
+                }
+            }
+            KeyCode::Char('d') => self.pending.op = Some('d'),
+            KeyCode::Char('u') => self.undo(),
+            KeyCode::Char('e') => {
+                let notes = self.todo(id).and_then(|t| t.notes.clone());
+                return Effect::EditNotes {
+                    id,
+                    notes: notes.unwrap_or_default(),
+                };
+            }
+            _ => self.mode = Mode::Normal,
+        }
+        Effect::None
+    }
+
+    /// The detail view a session prompt returns to.
+    fn back_to_detail(&mut self, kind: &InputKind) {
+        let (id, index) = match *kind {
+            InputKind::SessionLength { id, index } => (id, Some(index)),
+            InputKind::AddSession(id) => (id, None),
+            _ => return,
+        };
+        let count = self.todo(id).map_or(0, |t| t.sessions.len());
+        let selected = index.map_or(0, |i| count.saturating_sub(i + 1));
+        self.mode = Mode::Detail { id, selected };
+    }
+
+    fn commit_session(&mut self, kind: InputKind, text: &str) {
+        self.back_to_detail(&kind);
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(length) = parse_duration(text) else {
+            return self.error(format!("not a duration: {text:?} (try 34, 34m, 1h30m)"));
+        };
+        let Mode::Detail { selected, .. } = self.mode else {
+            return;
+        };
+        let now = self.now();
+        match kind {
+            InputKind::SessionLength { id, index } => {
+                self.edit_sessions(id, selected, |s| s.set_session_length(id, index, length))
+            }
+            InputKind::AddSession(id) => {
+                self.edit_sessions(id, 0, |s| s.add_session(id, length, now))
+            }
+            _ => {}
+        }
     }
 
     // ---- week board -----------------------------------------------------------
@@ -555,7 +833,8 @@ impl App {
                 self.log_key(key);
                 Effect::None
             }
-            Mode::Help | Mode::Detail => {
+            Mode::Detail { .. } => self.detail_key(key),
+            Mode::Help => {
                 self.mode = Mode::Normal;
                 Effect::None
             }
@@ -682,6 +961,7 @@ impl App {
                 (InputKind::EditTitle(t.id), LineEdit::new(t.title.clone()))
             }),
             KeyCode::Char('x') => self.toggle_done(),
+            KeyCode::Char('T') => self.timer_key(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.bump_priority(true),
             KeyCode::Char('-') => self.bump_priority(false),
             KeyCode::Char('e') => {
@@ -720,7 +1000,14 @@ impl App {
             }
             KeyCode::Char('q') => return Effect::Quit,
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Enter if self.current().is_some() => self.mode = Mode::Detail,
+            KeyCode::Enter => {
+                if let Some(t) = self.current() {
+                    self.mode = Mode::Detail {
+                        id: t.id,
+                        selected: 0,
+                    };
+                }
+            }
             KeyCode::Esc => self.search = None,
             _ => {}
         }
@@ -762,7 +1049,10 @@ impl App {
                         return self.commit_input(kind, text);
                     }
                     InputKind::Search { origin } => self.select(origin),
-                    InputKind::Command | InputKind::SetProject(_) => {}
+                    InputKind::SessionLength { .. } | InputKind::AddSession(_) => {
+                        self.back_to_detail(&kind)
+                    }
+                    InputKind::Command | InputKind::SetProject(_) | InputKind::TimerLength(_) => {}
                 }
             }
             _ => {
@@ -797,6 +1087,10 @@ impl App {
                 });
             }
             InputKind::Command => return self.run_command(&text),
+            InputKind::TimerLength(id) => self.start_timer(id, &text),
+            InputKind::SessionLength { .. } | InputKind::AddSession(_) => {
+                self.commit_session(kind, &text)
+            }
             InputKind::Search { origin } => {
                 if text.is_empty() {
                     self.select(origin);
@@ -934,6 +1228,9 @@ impl App {
     /// change left it; otherwise a newer change would be silently lost.
     fn revert_entry(&mut self, entry: LogEntry) {
         let id = entry.id;
+        if entry.op == "session" {
+            return self.error("recorded focus time can't be reverted");
+        }
         let result = self.repo.with_store(|s| {
             let current = s.get(id).cloned();
             let change = match (entry.kind(), current) {
@@ -1051,6 +1348,7 @@ impl App {
                 self.info("change markers cleared");
             }
             "show" => self.set_show_done(true),
+            "stop" => self.stop_timer(),
             "project" | "proj" => self.set_project_filter(if arg.is_empty() {
                 ProjectFilter::All
             } else {
@@ -1313,11 +1611,13 @@ fn log_filter(all: &[LogEntry], others_only: bool) -> Vec<LogEntry> {
 }
 
 /// True if `current` still matches the state `entry` left it in, ignoring
-/// `updated_at` (an unlogged no-op edit can bump it).
+/// `updated_at` (an unlogged no-op edit can bump it) and sessions (time
+/// tracked since is kept by any restore anyway).
 fn unchanged_since(current: &Todo, entry: &LogEntry) -> bool {
     entry.after.as_ref().is_some_and(|after| {
         Todo {
             updated_at: current.updated_at,
+            sessions: current.sessions.clone(),
             ..after.clone()
         } == *current
     })
@@ -2244,5 +2544,263 @@ pub(crate) mod tests {
         assert_eq!(app.view, View::List);
         press(&mut app, "L"); // week-only key
         assert_eq!(scheduled(&ts, 1), Some(ymd(9, 21)));
+    }
+
+    // ---- focus timer ------------------------------------------------------------
+
+    fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-05T09:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn t10() -> DateTime<Utc> {
+        t0() + chrono::Duration::minutes(10)
+    }
+
+    fn t25() -> DateTime<Utc> {
+        t0() + chrono::Duration::minutes(25)
+    }
+
+    fn t90() -> DateTime<Utc> {
+        t0() + chrono::Duration::minutes(90)
+    }
+
+    fn spent(ts: &TempStore, id: u64) -> i64 {
+        ts.store().get(id).unwrap().time_spent().num_minutes()
+    }
+
+    #[test]
+    fn t_prompts_for_minutes_starts_and_stops() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        let mut app = ts.app();
+        app.set_now(t0);
+
+        press(&mut app, "T");
+        let Mode::Input { kind, line } = &app.mode else {
+            panic!("T should prompt")
+        };
+        assert_eq!(*kind, InputKind::TimerLength(1));
+        assert_eq!(line.text, default_timer().num_minutes().to_string());
+
+        press(&mut app, "<BS><BS><BS>50m<CR>");
+        let timer = ts.store().active_timer().copied().unwrap();
+        assert_eq!((timer.todo, timer.planned_secs), (1, 3000));
+        assert_eq!(app.timer, Some(timer));
+
+        app.set_now(t10);
+        press(&mut app, "T");
+        assert_eq!(app.timer, None);
+        assert_eq!(spent(&ts, 1), 10);
+        assert!(app.message.as_ref().unwrap().text.contains("after 10m"));
+    }
+
+    #[test]
+    fn t_on_another_todo_switches_and_bad_input_is_refused() {
+        let ts = TempStore::new();
+        ts.seed(&["a", "b"]);
+        let mut app = ts.app();
+        app.sort = SortBy::Created;
+        app.rebuild_rows();
+        app.select(0); // b
+        app.set_now(t0);
+        press(&mut app, "T<CR>");
+        assert_eq!(app.timer.unwrap().todo, 2);
+
+        app.set_now(t10);
+        press(&mut app, "jT<BS><BS>soon<CR>");
+        assert!(app.message.as_ref().unwrap().error);
+        assert_eq!(app.timer.unwrap().todo, 2, "a bad length keeps the timer");
+
+        press(&mut app, "T<CR>");
+        assert_eq!(app.timer.unwrap().todo, 1);
+        assert_eq!(spent(&ts, 2), 10);
+        assert!(app.message.as_ref().unwrap().text.contains("stopped #2"));
+
+        press(&mut app, ":stop<CR>");
+        assert_eq!(app.timer, None);
+    }
+
+    #[test]
+    fn tick_rings_once_when_the_block_is_up_and_the_timer_runs_on() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        let mut app = ts.app();
+        app.set_now(t0);
+        press(&mut app, "T<CR>");
+
+        app.set_now(t10);
+        assert_eq!(app.tick(), None, "still in the block");
+        app.set_now(t25);
+        assert_eq!(app.tick().unwrap().id, 1, "rings when the block is up");
+        assert!(app
+            .message
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("counting overtime"));
+        assert_eq!(app.tick(), None, "only once");
+        assert!(ts.store().active_timer().is_some(), "and keeps running");
+        assert_eq!(spent(&ts, 1), 0);
+
+        // Opened long after the block ended: no bell, the header says it.
+        let mut late = ts.app();
+        late.set_now(t90);
+        assert_eq!(late.tick(), None);
+
+        app.set_now(t90);
+        press(&mut app, "T");
+        assert_eq!(spent(&ts, 1), 90, "overtime is recorded");
+        assert!(app.message.as_ref().unwrap().text.contains("1h5m over"));
+    }
+
+    #[test]
+    fn done_records_the_session_and_undo_keeps_it() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        let mut app = ts.app();
+        app.set_now(|| Utc::now() - chrono::Duration::minutes(30));
+        press(&mut app, "T<CR>");
+        press(&mut app, "x");
+        assert_eq!(app.timer, None);
+        assert_eq!(spent(&ts, 1), 30);
+
+        press(&mut app, "u");
+        assert_eq!(ts.store().get(1).unwrap().status, Status::Open);
+        assert_eq!(spent(&ts, 1), 30, "undo never throws time away");
+        assert_eq!(app.timer, None, "nor restarts the timer");
+    }
+
+    fn session_minutes(ts: &TempStore, id: u64) -> Vec<i64> {
+        ts.store()
+            .get(id)
+            .unwrap()
+            .sessions
+            .iter()
+            .map(|s| s.duration().num_minutes())
+            .collect()
+    }
+
+    #[test]
+    fn detail_view_fixes_adds_and_deletes_sessions_with_undo() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        ts.as_agent(|s| {
+            s.start_timer(1, chrono::Duration::minutes(25), t0())
+                .unwrap();
+            s.stop_timer(t10());
+            s.start_timer(1, chrono::Duration::minutes(25), t25())
+                .unwrap();
+            s.stop_timer(t25() + chrono::Duration::minutes(590));
+        });
+        let mut app = ts.app();
+
+        // The newest session is selected; `c` takes just a length.
+        press(&mut app, "<CR>c34m<CR>");
+        assert_eq!(session_minutes(&ts, 1), [10, 34]);
+        assert_eq!(app.mode, Mode::Detail { id: 1, selected: 0 });
+
+        press(&mut app, "jc");
+        assert_eq!(
+            app.mode,
+            Mode::Input {
+                kind: InputKind::SessionLength { id: 1, index: 0 },
+                line: LineEdit::default()
+            }
+        );
+        press(&mut app, "<Esc>");
+        assert_eq!(
+            app.mode,
+            Mode::Detail { id: 1, selected: 1 },
+            "Esc goes back"
+        );
+        press(&mut app, "dd");
+        assert_eq!(session_minutes(&ts, 1), [34]);
+
+        press(&mut app, "a45<CR>");
+        assert_eq!(session_minutes(&ts, 1), [34, 45]);
+        press(&mut app, "c<CR>");
+        assert_eq!(
+            session_minutes(&ts, 1),
+            [34, 45],
+            "empty input changes nothing"
+        );
+        press(&mut app, "csoon<CR>");
+        assert!(app.message.as_ref().unwrap().error);
+
+        press(&mut app, "uu");
+        assert_eq!(session_minutes(&ts, 1), [10, 34]);
+        assert!(
+            matches!(app.mode, Mode::Detail { id: 1, .. }),
+            "undo stays put"
+        );
+        press(&mut app, "<C-r>");
+        assert_eq!(session_minutes(&ts, 1), [34]);
+
+        press(&mut app, "x");
+        assert_eq!(app.mode, Mode::Normal, "other keys close it");
+        assert_eq!(ts.store().get(1).unwrap().status, Status::Open);
+    }
+
+    #[test]
+    fn detail_view_moves_within_the_sessions_and_opens_notes() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        ts.as_agent(|s| {
+            for _ in 0..3 {
+                s.add_session(1, chrono::Duration::minutes(5), t0())
+                    .unwrap();
+            }
+        });
+        let mut app = ts.app();
+        press(&mut app, "<CR>jjjj");
+        assert_eq!(app.mode, Mode::Detail { id: 1, selected: 2 });
+        press(&mut app, "k");
+        assert_eq!(app.mode, Mode::Detail { id: 1, selected: 1 });
+        let effects = press(&mut app, "e");
+        assert!(matches!(effects[0], Effect::EditNotes { id: 1, .. }));
+    }
+
+    #[test]
+    fn session_log_entries_cant_be_reverted_but_older_edits_still_can() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        let mut app = ts.app();
+        press(&mut app, "+");
+        app.set_now(t0);
+        press(&mut app, "T<CR>");
+        app.set_now(t10);
+        press(&mut app, "T");
+
+        press(&mut app, ":log<CR>r");
+        assert!(app.message.as_ref().unwrap().error);
+        assert_eq!(spent(&ts, 1), 10);
+
+        press(&mut app, "jr");
+        assert_eq!(ts.store().get(1).unwrap().priority, Priority::Medium);
+        assert_eq!(spent(&ts, 1), 10);
+    }
+
+    #[test]
+    fn timers_started_elsewhere_show_up_and_done_todos_refuse_one() {
+        let ts = TempStore::new();
+        ts.seed(&["a"]);
+        let mut app = ts.app();
+        ts.as_agent(|s| {
+            s.start_timer(1, chrono::Duration::minutes(5), t0())
+                .unwrap();
+        });
+        app.refresh_if_changed();
+        assert_eq!(app.timer.unwrap().todo, 1);
+
+        ts.as_agent(|s| {
+            s.stop_timer(t10());
+            s.set_status(1, Status::Done).unwrap();
+        });
+        app.refresh_if_changed();
+        press(&mut app, "T");
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.message.as_ref().unwrap().error);
     }
 }

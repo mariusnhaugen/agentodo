@@ -62,6 +62,17 @@ agentodo rm 2
 
 agentodo projects            # distinct projects with open/done counts
 
+agentodo start 1             # 25-minute focus timer on #1
+agentodo start 1 50m         # or 50, 1h, 1h30m
+agentodo timer               # what's running: time left, or +01:12 over
+agentodo stop                # record the time, overtime included
+
+agentodo time 1              # list #1's sessions, newest first
+agentodo time 1 34m          # fix the newest one (left running?) to 34 minutes
+agentodo time 1 20m -s 2     # fix the one before it
+agentodo time 1 --rm -s 2    # delete it
+agentodo time 1 --add 45m    # record time worked without the timer
+
 agentodo list --json         # machine-readable output (global flag)
 ```
 
@@ -86,6 +97,8 @@ the app for the full list.
 | `p`, `.`, `s` | project filter, show/hide done, toggle sort |
 | `:q` `:project [name]` `:sort priority\|created` `:hide` `:show` | commands |
 | `]c` `[c`, `:log`, `:seen` | jump between changed todos, change log, clear markers |
+| `T`, `:stop` | start a focus timer on this todo (asks how long) / stop it |
+| `Enter`, then `c` `dd` `a` | details, then change / delete / add time on the selected session |
 | `W`, `:week` `:list` | switch between the list and the week board |
 
 ### Week board
@@ -112,6 +125,46 @@ Every change is written immediately (reload → edit → save), and the store fi
 polled every second, so todos an agent adds over MCP appear while you watch
 without either side overwriting the other.
 
+## Focus timer
+
+Start a timer on a todo with a planned block of time, 25 minutes by default.
+When the block is up, the bell rings once and the timer keeps going,
+counting overtime (`+01:12`) until you stop it. A session records how long
+you really worked, so a task that runs over shows exactly how far over it
+went.
+
+One timer runs at a time. It lives in the store file, so it keeps going when
+you quit the TUI, and the CLI, TUI and agents all see the same timer.
+
+- **Stopping records the time**, overtime included. `T` or `:stop` stops it,
+  so does marking the todo done, and starting a timer on another todo
+  switches. Deleting the todo drops it.
+- **Fix it afterwards.** If you walked away and the timer ran all night,
+  correct the session instead of losing it. In the TUI, `Enter` on a todo
+  lists its sessions newest first, with overtime called out. The newest
+  session is selected; `c` takes a new length (`34m`), `dd` deletes, `a`
+  adds time worked without the timer, and `u` undoes. From the shell:
+  `agentodo time 3 34m`.
+- **Undo never loses time.** `u` and `:log` revert restore everything about a
+  todo except its sessions. Session edits have their own undo, and recorded
+  sessions can't be reverted from `:log`.
+
+While a timer runs, the TUI header shows `⏱ 18:42 #3 title`, and the todo's
+row (or its card on the week board) counts down, then counts up in yellow
+once it's in overtime. When the block is up, the TUI shows a banner and rings
+the terminal bell. Windows Terminal turns the bell into a taskbar flash. To
+get a desktop notification as well, set `$AGENTODO_TIMER_HOOK` to a shell
+command. It runs with `$AGENTODO_TODO_ID` and `$AGENTODO_TODO_TITLE` set.
+For example, a Windows toast from WSL:
+
+```sh
+export AGENTODO_TIMER_HOOK='powershell.exe -NoProfile -Command "New-BurntToastNotification -Text \"Block done\", \"$AGENTODO_TODO_TITLE\""'
+```
+
+The bell only rings from an open TUI, and only if the block ended in the
+last minute. A TUI opened later just shows the overtime. Set
+`$AGENTODO_TIMER_MINUTES` to change the default block (e.g. `30`).
+
 ## Change log
 
 Every change made through the CLI, TUI or MCP server is appended to
@@ -129,12 +182,15 @@ A revert is an ordinary change, so `u` undoes it.
 ## MCP server
 
 `agentodo-mcp` speaks the MCP stdio transport (newline-delimited JSON-RPC 2.0) and
-exposes seven tools, each mapping to one core operation. `add_todo`,
+exposes eight tools, each mapping to one core operation. `add_todo`,
 `update_todo` and `list_todos` take a `scheduled` day using the same words as the
 CLI, so an agent can plan your week:
 
 `add_todo`, `list_todos`, `get_todo`, `complete_todo`, `update_todo`, `delete_todo`,
-`list_projects`.
+`list_projects`, `get_timer`.
+
+`get_timer` is read-only: an agent can see what you're focused on, how long
+is left or how far into overtime you are, but only you start and stop timers.
 
 Register it with an MCP client. For Claude Code:
 

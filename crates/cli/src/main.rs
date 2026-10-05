@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use agentodo_core::{
-    parse_day, parse_scheduled_filter, Actor, Filter, NewTodo, Priority, ProjectSummary, SortBy,
-    Source, Status, Store, Todo, TodoPatch,
+    default_timer, format_duration, format_timer, parse_day, parse_duration,
+    parse_scheduled_filter, ActiveSession, Actor, Filter, NewTodo, Priority, ProjectSummary,
+    SortBy, Source, Status, Store, Todo, TodoPatch,
 };
 use anyhow::{anyhow, Context, Result};
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// A todo tracker you can drive from the command line.
@@ -42,6 +43,38 @@ enum Command {
     Rm { id: u64 },
     /// List distinct projects with todo counts.
     Projects,
+    /// Start a focus timer on a todo, ending any running one.
+    Start {
+        id: u64,
+        /// How long: minutes (25) or units (50m, 1h30m). Defaults to
+        /// $AGENTODO_TIMER_MINUTES, else 25 minutes.
+        duration: Option<String>,
+    },
+    /// Stop the focus timer, recording the time so far (overtime included).
+    Stop,
+    /// Show the running focus timer.
+    Timer,
+    /// List a todo's recorded sessions, or fix one.
+    ///
+    /// `agentodo time 3 34m` changes the newest session to 34 minutes;
+    /// `--session 2` picks the one before it (numbers as listed).
+    Time(TimeArgs),
+}
+
+#[derive(Debug, Args)]
+struct TimeArgs {
+    id: u64,
+    /// New length for the session: minutes (34) or units (34m, 1h30m).
+    length: Option<String>,
+    /// Which session, as numbered in the listing; 1 is the newest.
+    #[arg(short, long, default_value_t = 1)]
+    session: usize,
+    /// Record time worked without the timer, ending now.
+    #[arg(long, value_name = "LENGTH", conflicts_with_all = ["length", "rm"])]
+    add: Option<String>,
+    /// Delete the session instead.
+    #[arg(long, conflicts_with = "length")]
+    rm: bool,
 }
 
 #[derive(Debug, Args)]
@@ -146,6 +179,7 @@ fn main() -> Result<()> {
     let mut store =
         Store::load(&path).with_context(|| format!("loading store at {}", path.display()))?;
     store.set_actor(Actor::from_env(Source::Cli));
+    let now = Utc::now();
 
     match cli.command {
         Command::Add(args) => {
@@ -174,8 +208,9 @@ fn main() -> Result<()> {
                     .scheduled
                     .as_deref()
                     .map(|s| {
-                        parse_scheduled_filter(s, today())
-                            .ok_or_else(|| anyhow!("unknown day {s:?}: try today, fri, week, none or YYYY-MM-DD"))
+                        parse_scheduled_filter(s, today()).ok_or_else(|| {
+                            anyhow!("unknown day {s:?}: try today, fri, week, none or YYYY-MM-DD")
+                        })
                     })
                     .transpose()?,
                 sort: args.sort.into(),
@@ -184,8 +219,19 @@ fn main() -> Result<()> {
             print_list(&todos, cli.json)?;
         }
         Command::Show { id } => {
-            let todo = store.get(id).with_context(|| format!("no todo with id {id}"))?;
+            let todo = store
+                .get(id)
+                .with_context(|| format!("no todo with id {id}"))?;
             print_one(todo, cli.json)?;
+            if !cli.json {
+                if let Some(active) = store.active_timer().filter(|a| a.todo == id) {
+                    println!("  timer:    {}", timer_state(active, now));
+                }
+                if !todo.sessions.is_empty() {
+                    println!("  sessions:");
+                    print_sessions(todo, 10);
+                }
+            }
         }
         Command::Done { id } => {
             let todo = store.set_status(id, Status::Done)?;
@@ -202,8 +248,12 @@ fn main() -> Result<()> {
             let patch = TodoPatch {
                 title: args.title,
                 priority: args.priority.map(Into::into),
-                project: args.project.map(|p| if p.is_empty() { None } else { Some(p) }),
-                notes: args.notes.map(|n| if n.is_empty() { None } else { Some(n) }),
+                project: args
+                    .project
+                    .map(|p| if p.is_empty() { None } else { Some(p) }),
+                notes: args
+                    .notes
+                    .map(|n| if n.is_empty() { None } else { Some(n) }),
                 add_tags: args.add_tag,
                 remove_tags: args.remove_tag,
                 scheduled: match args.scheduled.as_deref() {
@@ -228,6 +278,77 @@ fn main() -> Result<()> {
         Command::Projects => {
             print_projects(&store.projects(), cli.json)?;
         }
+        Command::Start { id, duration } => {
+            let length = match duration.as_deref() {
+                None => default_timer(),
+                Some(s) => duration_arg(s)?,
+            };
+            let stopped = store.active_timer().copied();
+            let active = store.start_timer(id, length, now)?;
+            store.save()?;
+            if let Some(prev) = stopped.filter(|p| p.todo != id) {
+                if !cli.json {
+                    println!(
+                        "stopped #{} after {}",
+                        prev.todo,
+                        format_duration(now - prev.started_at)
+                    );
+                }
+            }
+            print_timer(&store, Some(&active), now, cli.json)?;
+        }
+        Command::Stop => {
+            let todo = store.stop_timer(now);
+            store.save()?;
+            match (todo, cli.json) {
+                (Some(todo), true) => print_one(&todo, true)?,
+                (Some(todo), false) => println!(
+                    "stopped #{} {} after {} ({} total)",
+                    todo.id,
+                    todo.title,
+                    format_duration(
+                        todo.sessions
+                            .last()
+                            .map_or_else(Default::default, |s| s.duration())
+                    ),
+                    format_duration(todo.time_spent())
+                ),
+                (None, true) => println!("null"),
+                (None, false) => println!("no timer running"),
+            }
+        }
+        Command::Timer => print_timer(&store, store.active_timer(), now, cli.json)?,
+        Command::Time(args) => {
+            let id = args.id;
+            let count = store
+                .get(id)
+                .with_context(|| format!("no todo with id {id}"))?
+                .sessions
+                .len();
+            // Listed newest first, numbered from 1.
+            let index = count
+                .checked_sub(args.session)
+                .filter(|_| args.session > 0)
+                .ok_or_else(|| anyhow!("#{id} has no session {}", args.session));
+            let changed = if let Some(add) = args.add.as_deref() {
+                Some(store.add_session(id, duration_arg(add)?, now)?)
+            } else if args.rm {
+                Some(store.delete_session(id, index?)?)
+            } else if let Some(length) = args.length.as_deref() {
+                Some(store.set_session_length(id, index?, duration_arg(length)?)?)
+            } else {
+                None
+            };
+            if changed.is_some() {
+                store.save()?;
+            }
+            let todo = store.get(id).expect("checked above");
+            if cli.json {
+                print_one(todo, true)?;
+            } else {
+                print_sessions(todo, usize::MAX);
+            }
+        }
     }
     Ok(())
 }
@@ -239,6 +360,76 @@ fn today() -> NaiveDate {
 fn day_arg(s: &str) -> Result<NaiveDate> {
     parse_day(s, today())
         .ok_or_else(|| anyhow!("unknown day {s:?}: try today, tomorrow, fri or YYYY-MM-DD"))
+}
+
+fn duration_arg(s: &str) -> Result<chrono::Duration> {
+    parse_duration(s).ok_or_else(|| anyhow!("unknown duration {s:?}: try 25, 34m or 1h30m"))
+}
+
+/// `18:42 left of 25m`, or `+01:12 over 25m` once the block is up.
+fn timer_state(active: &ActiveSession, now: DateTime<Utc>) -> String {
+    let planned = format_duration(active.ends_at() - active.started_at);
+    let clock = format_timer(active, now);
+    if active.is_over(now) {
+        format!("{clock} over {planned}")
+    } else {
+        format!("{clock} left of {planned}")
+    }
+}
+
+/// The newest `limit` sessions, numbered newest first as `time --session`
+/// takes them.
+fn print_sessions(t: &Todo, limit: usize) {
+    if t.sessions.is_empty() {
+        println!("#{} has no recorded time", t.id);
+        return;
+    }
+    for (n, s) in t.sessions.iter().rev().enumerate().take(limit) {
+        let (start, end) = (s.start.with_timezone(&Local), s.end.with_timezone(&Local));
+        let over = s
+            .overtime()
+            .map(|o| format!("  +{} over", format_duration(o)))
+            .unwrap_or_default();
+        println!(
+            "  {:>3}  {}  {}–{}  {:>6}{over}",
+            n + 1,
+            start.format("%a %-d %b"),
+            start.format("%H:%M"),
+            end.format("%H:%M"),
+            format_duration(s.duration()),
+        );
+    }
+    let earlier = t.sessions.len().saturating_sub(limit);
+    if earlier > 0 {
+        println!("       +{earlier} earlier (agentodo time {})", t.id);
+    }
+}
+
+fn print_timer(
+    store: &Store,
+    active: Option<&ActiveSession>,
+    now: DateTime<Utc>,
+    json: bool,
+) -> Result<()> {
+    let Some(active) = active else {
+        println!("{}", if json { "null" } else { "no timer running" });
+        return Ok(());
+    };
+    if json {
+        let value = serde_json::json!({
+            "todo": active.todo,
+            "started_at": active.started_at,
+            "planned_secs": active.planned_secs,
+            "ends_at": active.ends_at(),
+            "remaining_secs": active.remaining(now).num_seconds(),
+            "overtime_secs": active.overtime(now).num_seconds(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+    let title = store.get(active.todo).map_or("", |t| t.title.as_str());
+    println!("⏱ #{} {}  {}", active.todo, title, timer_state(active, now));
+    Ok(())
 }
 
 fn print_one(todo: &Todo, json: bool) -> Result<()> {
@@ -342,6 +533,14 @@ fn print_detail(t: &Todo) {
     }
     if let Some(d) = t.scheduled {
         println!("  on:       {}", d.format("%a %Y-%m-%d"));
+    }
+    if !t.sessions.is_empty() {
+        let n = t.sessions.len();
+        println!(
+            "  time:     {} ({n} session{})",
+            format_duration(t.time_spent()),
+            if n == 1 { "" } else { "s" }
+        );
     }
     println!("  created:  {}", t.created_at.to_rfc3339());
     if let Some(c) = t.completed_at {

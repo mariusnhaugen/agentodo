@@ -8,7 +8,7 @@ use agentodo_core::{
     parse_day, parse_scheduled_filter, Actor, Filter, NewTodo, Priority, SortBy, Source, Status,
     Store, TodoPatch,
 };
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, Utc};
 use serde_json::{json, Value};
 
 /// The result of invoking a tool: text to return to the caller, and whether it
@@ -90,7 +90,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "get_todo",
-            "description": "Fetch a single todo by id.",
+            "description": "Fetch a single todo by id, including its focus sessions and total time_spent_secs.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "integer" } },
@@ -143,6 +143,14 @@ pub fn definitions() -> Value {
                 "type": "object",
                 "properties": {}
             }
+        },
+        {
+            "name": "get_timer",
+            "description": "The user's running focus timer: which todo they're working on, how long is left in the planned block, and how far past it they've gone (overtime_secs). The timer keeps running until the user stops it. Returns null when no timer is running. Read-only; the user starts and stops timers themselves.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -157,6 +165,7 @@ pub fn call(name: &str, args: &Value) -> ToolResult {
         "update_todo" => update_todo(args),
         "delete_todo" => delete_todo(args),
         "list_projects" => list_projects(args),
+        "get_timer" => get_timer(args),
         other => Err(format!("unknown tool: {other}")),
     };
     match result {
@@ -174,9 +183,7 @@ fn require_id(args: &Value) -> Result<u64, String> {
 }
 
 fn opt_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
+    args.get(key).and_then(Value::as_str).map(|s| s.to_string())
 }
 
 fn opt_priority(args: &Value) -> Result<Option<Priority>, String> {
@@ -264,9 +271,30 @@ fn get_todo(args: &Value) -> Result<Value, String> {
     let id = require_id(args)?;
     let store = load()?;
     match store.get(id) {
-        Some(todo) => Ok(json!(todo)),
+        Some(todo) => {
+            let mut value = json!(todo);
+            value["time_spent_secs"] = json!(todo.time_spent().num_seconds());
+            Ok(value)
+        }
         None => Err(format!("no todo with id {id}")),
     }
+}
+
+fn get_timer(_args: &Value) -> Result<Value, String> {
+    let store = load()?;
+    let Some(active) = store.active_timer() else {
+        return Ok(Value::Null);
+    };
+    let now = Utc::now();
+    Ok(json!({
+        "todo": active.todo,
+        "title": store.get(active.todo).map(|t| t.title.clone()),
+        "started_at": active.started_at,
+        "planned_secs": active.planned_secs,
+        "ends_at": active.ends_at(),
+        "remaining_secs": active.remaining(now).num_seconds(),
+        "overtime_secs": active.overtime(now).num_seconds(),
+    }))
 }
 
 fn complete_todo(args: &Value) -> Result<Value, String> {

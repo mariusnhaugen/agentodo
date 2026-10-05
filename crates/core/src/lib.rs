@@ -10,14 +10,18 @@ mod log;
 mod model;
 mod parse;
 mod store;
+mod timer;
 
 pub use date::{parse_day, parse_scheduled_filter, week_start, ScheduledFilter};
 pub use error::{Error, Result};
 pub use filter::{Filter, SortBy};
 pub use log::{log_path, read_log, read_log_from, Actor, EntryKind, FieldChange, LogEntry, Source};
-pub use model::{NewTodo, Priority, ProjectSummary, Status, Todo, TodoPatch};
+pub use model::{
+    ActiveSession, NewTodo, Priority, ProjectSummary, Session, Status, Todo, TodoPatch,
+};
 pub use parse::{parse_quick_add, QuickAdd};
 pub use store::Store;
+pub use timer::{default_timer, format_countdown, format_duration, format_timer, parse_duration};
 
 #[cfg(test)]
 mod tests {
@@ -566,5 +570,160 @@ mod tests {
         assert_eq!(titles("today"), ["fri"]);
         assert_eq!(titles("week"), ["fri", "mon"]);
         assert_eq!(titles("2026-09-28"), ["next"]);
+    }
+
+    fn at(min: i64) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 10, 5, 9, 0, 0).unwrap() + chrono::Duration::minutes(min)
+    }
+
+    fn mins(n: i64) -> chrono::Duration {
+        chrono::Duration::minutes(n)
+    }
+
+    #[test]
+    fn stopping_records_the_time_including_overtime() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let t = store.add(NewTodo::default());
+        let active = store.start_timer(t.id, mins(25), at(0)).unwrap();
+        assert_eq!(active.remaining(at(7)), mins(18));
+        assert!(!active.is_over(at(24)));
+        assert_eq!(active.overtime(at(40)), mins(15));
+        assert_eq!(store.active_timer(), Some(&active));
+
+        let early = store.stop_timer(at(10)).unwrap();
+        assert_eq!(early.time_spent(), mins(10));
+        assert_eq!(early.sessions[0].overtime(), None);
+        assert_eq!(store.active_timer(), None);
+        assert_eq!(store.stop_timer(at(11)), None, "nothing left to stop");
+
+        // A forgotten timer runs on until stopped: nothing closes it.
+        store.start_timer(t.id, mins(25), at(100)).unwrap();
+        let late = store.stop_timer(at(100 + 25 + 565)).unwrap();
+        assert_eq!(late.sessions[1].duration(), mins(590));
+        assert_eq!(late.sessions[1].overtime(), Some(mins(565)));
+    }
+
+    #[test]
+    fn recorded_sessions_can_be_shortened_deleted_and_added() {
+        let path = temp_store_path("edit-sessions");
+        let mut store = Store::load(&path).unwrap();
+        let t = store.add(NewTodo::default());
+        store.start_timer(t.id, mins(25), at(0)).unwrap();
+        store.stop_timer(at(590)).unwrap();
+
+        let fixed = store.set_session_length(t.id, 0, mins(29)).unwrap();
+        assert_eq!(fixed.sessions[0].start, at(0));
+        assert_eq!(fixed.sessions[0].end, at(29));
+        assert_eq!(fixed.sessions[0].overtime(), Some(mins(4)));
+
+        let added = store.add_session(t.id, mins(45), at(1000)).unwrap();
+        assert_eq!(added.sessions[1].start, at(955));
+        assert_eq!(added.sessions[1].overtime(), None, "no block, no overtime");
+        assert_eq!(added.time_spent(), mins(74));
+
+        let deleted = store.delete_session(t.id, 0).unwrap();
+        assert_eq!(deleted.time_spent(), mins(45));
+        assert!(matches!(
+            store.delete_session(t.id, 5),
+            Err(Error::NoSession { id: 1, index: 5 })
+        ));
+        assert!(matches!(
+            store.add_session(9, mins(5), at(0)),
+            Err(Error::NotFound(9))
+        ));
+
+        let restored = store.set_sessions(t.id, fixed.sessions.clone()).unwrap();
+        assert_eq!(restored.sessions, fixed.sessions);
+        store.save().unwrap();
+
+        let log = read_log(&store.log_path()).unwrap();
+        let ops: Vec<&str> = log.iter().map(|e| e.op.as_str()).collect();
+        assert_eq!(
+            ops,
+            ["add", "session", "session", "session", "session", "session"]
+        );
+        let diff = log[2].diff();
+        assert_eq!(
+            (diff[0].field, diff[0].old.as_str(), diff[0].new.as_str()),
+            ("time", "9h50m", "29m")
+        );
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn starting_another_timer_switches_and_records_the_first() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let a = store.add(NewTodo::default());
+        let b = store.add(NewTodo::default());
+        store.start_timer(a.id, mins(25), at(0)).unwrap();
+        store.start_timer(b.id, mins(50), at(5)).unwrap();
+
+        assert_eq!(store.get(a.id).unwrap().time_spent(), mins(5));
+        assert_eq!(store.active_timer().unwrap().todo, b.id);
+        assert!(matches!(
+            store.start_timer(99, mins(5), at(6)),
+            Err(Error::NotFound(99))
+        ));
+        assert_eq!(
+            store.active_timer().unwrap().todo,
+            b.id,
+            "failed start keeps the timer"
+        );
+
+        // A restart at the same instant records nothing.
+        store.start_timer(b.id, mins(50), at(5)).unwrap();
+        assert!(store.get(b.id).unwrap().sessions.is_empty());
+    }
+
+    #[test]
+    fn done_stops_the_timer_and_delete_drops_it() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let a = store.add(NewTodo::default());
+        let b = store.add(NewTodo::default());
+
+        let started = chrono::Utc::now() - mins(40);
+        store.start_timer(b.id, mins(25), started).unwrap();
+        store.set_status(a.id, Status::Done).unwrap();
+        assert!(store.active_timer().is_some(), "other todos don't stop it");
+        let done = store.set_status(b.id, Status::Done).unwrap();
+        assert!(done.time_spent() >= mins(40), "overtime counts");
+        assert_eq!(store.active_timer(), None);
+
+        store.start_timer(a.id, mins(25), at(0)).unwrap();
+        let removed = store.delete(a.id).unwrap();
+        assert!(removed.sessions.is_empty());
+        assert_eq!(store.active_timer(), None);
+    }
+
+    #[test]
+    fn replace_keeps_sessions_so_undo_never_loses_time() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let t = store.add(NewTodo::default());
+        store.start_timer(t.id, mins(25), at(0)).unwrap();
+        store.stop_timer(at(25)).unwrap();
+
+        let restored = store.replace(t.clone()).unwrap();
+        assert_eq!(restored.time_spent(), mins(25));
+    }
+
+    #[test]
+    fn the_running_timer_survives_a_save_and_old_stores_still_load() {
+        let path = temp_store_path("active");
+        let mut store = Store::load(&path).unwrap();
+        let t = store.add(NewTodo::default());
+        store.save().unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("active_session") && !json.contains("sessions"));
+
+        let active = store.start_timer(t.id, mins(25), at(0)).unwrap();
+        store.save().unwrap();
+        assert_eq!(Store::load(&path).unwrap().active_timer(), Some(&active));
+
+        std::fs::write(&path, r#"{"next_id": 1, "todos": []}"#).unwrap();
+        assert_eq!(Store::load(&path).unwrap().active_timer(), None);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
