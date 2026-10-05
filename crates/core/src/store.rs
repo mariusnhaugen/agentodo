@@ -263,6 +263,7 @@ impl Store {
             tags: new.tags,
             notes: new.notes,
             scheduled: new.scheduled,
+            plan_secs: new.plan.map(plan_secs),
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -297,6 +298,9 @@ impl Store {
         }
         if let Some(scheduled) = patch.scheduled {
             todo.scheduled = scheduled;
+        }
+        if let Some(plan) = patch.plan {
+            todo.plan_secs = plan.map(plan_secs);
         }
         for tag in patch.remove_tags {
             todo.tags.retain(|t| t != &tag);
@@ -505,4 +509,9 @@ impl Store {
         self.record("session", active.todo, Some(before), Some(after.clone()));
         Some(after)
     }
+}
+
+/// A plan as stored: whole seconds, never negative.
+fn plan_secs(plan: Duration) -> u64 {
+    plan.num_seconds().max(0) as u64
 }

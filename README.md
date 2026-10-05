@@ -62,7 +62,10 @@ agentodo rm 2
 
 agentodo projects            # distinct projects with open/done counts
 
-agentodo start 1             # 25-minute focus timer on #1
+agentodo add "write docs" --plan 2h    # budget time for it
+agentodo edit 2 --plan none            # drop the budget
+
+agentodo start 1             # focus timer on #1: what's left of its plan, else 25m
 agentodo start 1 50m         # or 50, 1h, 1h30m
 agentodo timer               # what's running: time left, or +01:12 over
 agentodo stop                # record the time, overtime included
@@ -88,7 +91,7 @@ the app for the full list.
 | Keys | Action |
 |---|---|
 | `j` `k` (with counts), `gg` `G`, `C-d` `C-u` | move |
-| `o` `O` | add below / above — `title !h +project #tag` |
+| `o` `O` | add below / above — `title !h +project #tag ~2h` |
 | `i`, `cc` | edit / retype title |
 | `dd`, `3dd` | delete |
 | `x`, `+` `-`, `gp`, `e` | toggle done, priority, project, notes in `$EDITOR` |
@@ -98,6 +101,7 @@ the app for the full list.
 | `:q` `:project [name]` `:sort priority\|created` `:hide` `:show` | commands |
 | `]c` `[c`, `:log`, `:seen` | jump between changed todos, change log, clear markers |
 | `T`, `:stop` | start a focus timer on this todo (asks how long) / stop it |
+| `t` | plan time for this todo (`45m`, `2h`); empty clears it |
 | `Enter`, then `c` `dd` `a` | details, then change / delete / add time on the selected session |
 | `W`, `:week` `:list` | switch between the list and the week board |
 
@@ -165,6 +169,23 @@ The bell only rings from an open TUI, and only if the block ended in the
 last minute. A TUI opened later just shows the overtime. Set
 `$AGENTODO_TIMER_MINUTES` to change the default block (e.g. `30`).
 
+### Planning time
+
+Give a todo a budget for the whole task, across however many sessions it
+takes: `~2h` when adding or retitling, `t` on an existing one, `--plan 2h` in
+the CLI, or `plan` over MCP. Then:
+
+- The list shows time spent against the plan, `45m/2h`. It turns yellow once
+  you're over.
+- On the week board, each card shows what's left (`~1h15m`, or `~over`), and
+  each day's header adds up what's left for its open todos (`Fri 25 3h30m`).
+  An overloaded day is visible while you move cards around.
+- `T` fills in what's left of the plan, falling back to the default block
+  once it's used up.
+- `Enter` shows `planned  2h · 45m spent · 1h15m left`.
+
+A running timer counts toward all of these as it goes.
+
 ## Change log
 
 Every change made through the CLI, TUI or MCP server is appended to
@@ -189,7 +210,8 @@ CLI, so an agent can plan your week:
 `add_todo`, `list_todos`, `get_todo`, `complete_todo`, `update_todo`, `delete_todo`,
 `list_projects`, `get_timer`.
 
-`get_timer` is read-only: an agent can see what you're focused on, how long
+`add_todo` and `update_todo` also take a `plan` (`30m`, `2h`), so an agent can
+budget your time as well as schedule it. `get_timer` is read-only: an agent can see what you're focused on, how long
 is left or how far into overtime you are, but only you start and stop timers.
 
 Register it with an MCP client. For Claude Code:

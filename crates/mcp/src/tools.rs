@@ -5,8 +5,8 @@
 use std::sync::OnceLock;
 
 use agentodo_core::{
-    parse_day, parse_scheduled_filter, Actor, Filter, NewTodo, Priority, SortBy, Source, Status,
-    Store, TodoPatch,
+    parse_day, parse_duration, parse_scheduled_filter, Actor, Filter, NewTodo, Priority, SortBy,
+    Source, Status, Store, TodoPatch,
 };
 use chrono::{Local, NaiveDate, Utc};
 use serde_json::{json, Value};
@@ -68,7 +68,8 @@ pub fn definitions() -> Value {
                     "project": { "type": "string", "description": "Optional project the todo belongs to." },
                     "tags": { "type": "array", "items": { "type": "string" } },
                     "notes": { "type": "string" },
-                    "scheduled": { "type": "string", "description": "Day to work on it (a soft plan, not a deadline): today, tomorrow, mon…sun (next occurrence) or YYYY-MM-DD." }
+                    "scheduled": { "type": "string", "description": "Day to work on it (a soft plan, not a deadline): today, tomorrow, mon…sun (next occurrence) or YYYY-MM-DD." },
+                    "plan": { "type": "string", "description": "Time budgeted for the whole todo, across sessions: 30m, 2h, 1h30m (bare numbers are minutes)." }
                 },
                 "required": ["title"]
             }
@@ -90,7 +91,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "get_todo",
-            "description": "Fetch a single todo by id, including its focus sessions and total time_spent_secs.",
+            "description": "Fetch a single todo by id, including its focus sessions, total time_spent_secs, and plan_secs (time budgeted) if set.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "integer" } },
@@ -111,7 +112,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "update_todo",
-            "description": "Edit fields of an existing todo. Omitted fields are unchanged. Pass an empty string for project/notes/scheduled to clear them.",
+            "description": "Edit fields of an existing todo. Omitted fields are unchanged. Pass an empty string for project/notes/scheduled/plan to clear them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -121,6 +122,7 @@ pub fn definitions() -> Value {
                     "project": { "type": "string" },
                     "notes": { "type": "string" },
                     "scheduled": { "type": "string", "description": "Day to work on it: today, tomorrow, mon…sun or YYYY-MM-DD. Empty string or none unschedules it." },
+                    "plan": { "type": "string", "description": "Time budgeted for the whole todo: 30m, 2h, 1h30m. Empty string or none clears it." },
                     "add_tags": { "type": "array", "items": { "type": "string" } },
                     "remove_tags": { "type": "array", "items": { "type": "string" } }
                 },
@@ -218,6 +220,10 @@ fn day(s: &str) -> Result<NaiveDate, String> {
 
 // --- tool implementations ---------------------------------------------------
 
+fn plan(s: &str) -> Result<chrono::Duration, String> {
+    parse_duration(s).ok_or_else(|| format!("invalid plan {s:?}: try 30m, 2h or 1h30m"))
+}
+
 fn add_todo(args: &Value) -> Result<Value, String> {
     let title = opt_str(args, "title").ok_or("missing 'title'")?;
     let mut store = load()?;
@@ -228,6 +234,7 @@ fn add_todo(args: &Value) -> Result<Value, String> {
         tags: string_array(args, "tags"),
         notes: opt_str(args, "notes"),
         scheduled: opt_str(args, "scheduled").as_deref().map(day).transpose()?,
+        plan: opt_str(args, "plan").as_deref().map(plan).transpose()?,
     });
     store.save().map_err(|e| e.to_string())?;
     Ok(json!(todo))
@@ -321,6 +328,11 @@ fn update_todo(args: &Value) -> Result<Value, String> {
             None => None,
             Some("" | "none") => Some(None),
             Some(s) => Some(Some(day(s)?)),
+        },
+        plan: match opt_str(args, "plan").as_deref() {
+            None => None,
+            Some("" | "none") => Some(None),
+            Some(s) => Some(Some(plan(s)?)),
         },
     };
     let mut store = load()?;

@@ -95,6 +95,11 @@ impl LogEntry {
         let lower = |s: String| s.to_lowercase();
         let opt = |o: &Option<String>| o.clone().unwrap_or_default();
         let day = |d: &Option<chrono::NaiveDate>| d.map(|d| d.to_string()).unwrap_or_default();
+        let plan = |t: &Todo| {
+            t.plan()
+                .map(crate::timer::format_duration)
+                .unwrap_or_default()
+        };
         let spent = |t: &Todo| match t.sessions.len() {
             0 => String::new(),
             _ => crate::timer::format_duration(t.time_spent()),
@@ -115,6 +120,7 @@ impl LogEntry {
             ("tags", a.tags.join(" "), b.tags.join(" ")),
             ("notes", opt(&a.notes), opt(&b.notes)),
             ("scheduled", day(&a.scheduled), day(&b.scheduled)),
+            ("plan", plan(a), plan(b)),
             ("time", spent(a), spent(b)),
         ];
         fields

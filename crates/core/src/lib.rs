@@ -35,6 +35,7 @@ mod tests {
             tags: vec!["errand".into()],
             notes: None,
             scheduled: None,
+            plan: None,
         });
         store.add(NewTodo {
             title: "ship release".into(),
@@ -43,6 +44,7 @@ mod tests {
             tags: vec!["urgent".into()],
             notes: Some("cut the tag first".into()),
             scheduled: None,
+            plan: None,
         });
     }
 
@@ -723,6 +725,63 @@ mod tests {
 
         std::fs::write(&path, r#"{"next_id": 1, "todos": []}"#).unwrap();
         assert_eq!(Store::load(&path).unwrap().active_timer(), None);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn plan_is_set_cleared_diffed_and_counts_down() {
+        let path = temp_store_path("plan");
+        let mut store = Store::load(&path).unwrap();
+        let t = store.add(NewTodo {
+            title: "write docs".into(),
+            plan: Some(mins(120)),
+            ..Default::default()
+        });
+        assert_eq!(t.plan(), Some(mins(120)));
+        assert_eq!(t.plan_left(mins(0)), Some(mins(120)));
+
+        store.start_timer(t.id, mins(25), at(0)).unwrap();
+        let t = store.stop_timer(at(45)).unwrap();
+        assert_eq!(t.plan_left(mins(0)), Some(mins(75)));
+        assert_eq!(
+            t.plan_left(mins(15)),
+            Some(mins(60)),
+            "a running timer counts"
+        );
+        assert_eq!(t.plan_left(mins(500)), Some(mins(0)), "never negative");
+
+        let replanned = store
+            .update(
+                t.id,
+                TodoPatch {
+                    plan: Some(Some(mins(30))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(replanned.plan_secs, Some(1800));
+        let cleared = store
+            .update(
+                t.id,
+                TodoPatch {
+                    plan: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.plan(), None);
+        assert_eq!(cleared.plan_left(mins(0)), None);
+        store.save().unwrap();
+
+        let log = read_log(&store.log_path()).unwrap();
+        let diff = log[2].diff();
+        assert_eq!(
+            (diff[0].field, diff[0].old.as_str(), diff[0].new.as_str()),
+            ("plan", "2h", "30m")
+        );
+        let json = serde_json::to_string(&cleared).unwrap();
+        assert!(!json.contains("plan_secs"));
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }

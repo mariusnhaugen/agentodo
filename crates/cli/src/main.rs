@@ -46,8 +46,8 @@ enum Command {
     /// Start a focus timer on a todo, ending any running one.
     Start {
         id: u64,
-        /// How long: minutes (25) or units (50m, 1h30m). Defaults to
-        /// $AGENTODO_TIMER_MINUTES, else 25 minutes.
+        /// How long: minutes (25) or units (50m, 1h30m). Defaults to what's
+        /// left of the todo's plan, else $AGENTODO_TIMER_MINUTES, else 25.
         duration: Option<String>,
     },
     /// Stop the focus timer, recording the time so far (overtime included).
@@ -93,6 +93,9 @@ struct AddArgs {
     /// Day to work on it: today, tomorrow, mon…sun or YYYY-MM-DD.
     #[arg(short, long, value_name = "DAY")]
     scheduled: Option<String>,
+    /// Time budgeted for the whole todo: 30m, 2h, 1h30m.
+    #[arg(long, value_name = "LENGTH")]
+    plan: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -132,6 +135,9 @@ struct EditArgs {
     /// Set the day to work on it (today, fri, YYYY-MM-DD…), or `none` to unschedule.
     #[arg(short, long, value_name = "DAY|none")]
     scheduled: Option<String>,
+    /// Set the time budgeted for it (30m, 2h…), or `none` to clear it.
+    #[arg(long, value_name = "LENGTH|none")]
+    plan: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -190,6 +196,7 @@ fn main() -> Result<()> {
                 tags: args.tags,
                 notes: args.notes,
                 scheduled: args.scheduled.as_deref().map(day_arg).transpose()?,
+                plan: args.plan.as_deref().map(duration_arg).transpose()?,
             });
             store.save()?;
             print_one(&todo, cli.json)?;
@@ -261,6 +268,11 @@ fn main() -> Result<()> {
                     Some("none") => Some(None),
                     Some(s) => Some(Some(day_arg(s)?)),
                 },
+                plan: match args.plan.as_deref() {
+                    None => None,
+                    Some("none" | "") => Some(None),
+                    Some(s) => Some(Some(duration_arg(s)?)),
+                },
             };
             let todo = store.update(id, patch)?;
             store.save()?;
@@ -280,7 +292,11 @@ fn main() -> Result<()> {
         }
         Command::Start { id, duration } => {
             let length = match duration.as_deref() {
-                None => default_timer(),
+                None => store
+                    .get(id)
+                    .and_then(|t| t.plan_left(chrono::Duration::zero()))
+                    .filter(|left| *left > chrono::Duration::zero())
+                    .unwrap_or_else(default_timer),
                 Some(s) => duration_arg(s)?,
             };
             let stopped = store.active_timer().copied();
@@ -464,6 +480,13 @@ fn print_list(todos: &[Todo], json: bool) -> Result<()> {
         for tag in &t.tags {
             meta.push_str(&format!("  #{tag}"));
         }
+        if let Some(plan) = t.plan() {
+            meta.push_str(&format!(
+                "  ~{}/{}",
+                format_duration(t.time_spent()),
+                format_duration(plan)
+            ));
+        }
         println!(
             "{:>4}  [{}] {:<6}  {:<6}  {}{}",
             t.id,
@@ -533,6 +556,19 @@ fn print_detail(t: &Todo) {
     }
     if let Some(d) = t.scheduled {
         println!("  on:       {}", d.format("%a %Y-%m-%d"));
+    }
+    if let Some(plan) = t.plan() {
+        let spent = t.time_spent();
+        let status = if spent > plan {
+            format!("{} over", format_duration(spent - plan))
+        } else {
+            format!("{} left", format_duration(plan - spent))
+        };
+        println!(
+            "  plan:     {} · {} spent · {status}",
+            format_duration(plan),
+            format_duration(spent)
+        );
     }
     if !t.sessions.is_empty() {
         let n = t.sessions.len();

@@ -73,6 +73,8 @@ pub enum InputKind {
     Search { origin: usize },
     /// `T`: how long to focus on a todo.
     TimerLength(u64),
+    /// `t`: the time budgeted for a todo; empty clears it.
+    Plan(u64),
     /// `c` in the detail view: a new length for session `index` (oldest
     /// first) of todo `id`.
     SessionLength { id: u64, index: usize },
@@ -449,11 +451,50 @@ impl App {
         if t.status == Status::Done {
             return self.error(format!("#{id} is done"));
         }
-        let minutes = default_timer().num_minutes().to_string();
+        // What's left of the plan, else the default block.
+        let length = match t.plan_left(chrono::Duration::zero()) {
+            Some(left) if left > chrono::Duration::zero() => format_duration(left),
+            _ => default_timer().num_minutes().to_string(),
+        };
         self.mode = Mode::Input {
             kind: InputKind::TimerLength(id),
-            line: LineEdit::new(minutes),
+            line: LineEdit::new(length),
         };
+    }
+
+    /// Time the running timer has put on `id` so far, if it's running there.
+    pub fn running_on(&self, id: u64) -> chrono::Duration {
+        self.timer
+            .filter(|t| t.todo == id)
+            .map_or(chrono::Duration::zero(), |t| {
+                (self.now() - t.started_at).max(chrono::Duration::zero())
+            })
+    }
+
+    /// What's left of `t`'s plan, counting a timer running on it.
+    pub fn plan_left(&self, t: &Todo) -> Option<chrono::Duration> {
+        t.plan_left(self.running_on(t.id))
+    }
+
+    fn set_plan(&mut self, id: u64, text: &str) {
+        let plan = match text.trim() {
+            "" => None,
+            text => match parse_duration(text) {
+                Some(plan) => Some(plan),
+                None => {
+                    return self.error(format!("not a duration: {text:?} (try 30m, 2h, 1h30m)"))
+                }
+            },
+        };
+        self.update(id, |s, id| {
+            s.update(
+                id,
+                TodoPatch {
+                    plan: Some(plan),
+                    ..Default::default()
+                },
+            )
+        });
     }
 
     fn start_timer(&mut self, id: u64, text: &str) {
@@ -962,6 +1003,9 @@ impl App {
             }),
             KeyCode::Char('x') => self.toggle_done(),
             KeyCode::Char('T') => self.timer_key(),
+            KeyCode::Char('t') => {
+                self.start_input_on_current(|t| (InputKind::Plan(t.id), LineEdit::default()))
+            }
             KeyCode::Char('+') | KeyCode::Char('=') => self.bump_priority(true),
             KeyCode::Char('-') => self.bump_priority(false),
             KeyCode::Char('e') => {
@@ -1052,7 +1096,10 @@ impl App {
                     InputKind::SessionLength { .. } | InputKind::AddSession(_) => {
                         self.back_to_detail(&kind)
                     }
-                    InputKind::Command | InputKind::SetProject(_) | InputKind::TimerLength(_) => {}
+                    InputKind::Command
+                    | InputKind::SetProject(_)
+                    | InputKind::TimerLength(_)
+                    | InputKind::Plan(_) => {}
                 }
             }
             _ => {
@@ -1088,6 +1135,7 @@ impl App {
             }
             InputKind::Command => return self.run_command(&text),
             InputKind::TimerLength(id) => self.start_timer(id, &text),
+            InputKind::Plan(id) => self.set_plan(id, &text),
             InputKind::SessionLength { .. } | InputKind::AddSession(_) => {
                 self.commit_session(kind, &text)
             }
@@ -1436,6 +1484,7 @@ impl App {
                 View::List => None,
                 View::Week => self.column_day(self.col),
             },
+            plan: parsed.plan,
         };
         match self.repo.with_store(|s| Ok(s.add(new))) {
             Ok(todo) => {
@@ -1457,6 +1506,7 @@ impl App {
             title: Some(parsed.title),
             priority: parsed.priority,
             project: parsed.project.map(Some),
+            plan: parsed.plan.map(Some),
             add_tags: parsed.tags,
             ..Default::default()
         };
@@ -1662,6 +1712,7 @@ pub(crate) mod tests {
                     tags: q.tags,
                     notes: None,
                     scheduled: None,
+                    plan: q.plan,
                 });
             }
             store.save().unwrap();
@@ -2802,5 +2853,82 @@ pub(crate) mod tests {
         press(&mut app, "T");
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.message.as_ref().unwrap().error);
+    }
+
+    // ---- plans ------------------------------------------------------------------
+
+    fn plan_minutes(ts: &TempStore, id: u64) -> Option<i64> {
+        ts.store().get(id).unwrap().plan().map(|p| p.num_minutes())
+    }
+
+    #[test]
+    fn plans_come_from_the_tilde_token_and_t() {
+        let ts = TempStore::new();
+        ts.seed(&["existing"]);
+        let mut app = ts.app();
+
+        press(&mut app, "owrite docs ~1h30m +work<CR>");
+        let id = app.current().unwrap().id;
+        assert_eq!(app.current().unwrap().title, "write docs");
+        assert_eq!(plan_minutes(&ts, id), Some(90));
+
+        press(&mut app, "t45m<CR>");
+        assert_eq!(plan_minutes(&ts, id), Some(45));
+        press(&mut app, "tsoon<CR>");
+        assert!(app.message.as_ref().unwrap().error);
+        assert_eq!(plan_minutes(&ts, id), Some(45));
+
+        press(&mut app, "t<CR>");
+        assert_eq!(plan_minutes(&ts, id), None, "empty clears");
+        press(&mut app, "u");
+        assert_eq!(plan_minutes(&ts, id), Some(45));
+
+        // Retitling with a token replans; without one the plan stays.
+        press(&mut app, "ccwrite more docs ~2h<CR>");
+        assert_eq!(plan_minutes(&ts, id), Some(120));
+        press(&mut app, "ccwrite docs<CR>");
+        assert_eq!(plan_minutes(&ts, id), Some(120));
+    }
+
+    #[test]
+    fn t_fills_in_what_is_left_of_the_plan() {
+        let ts = TempStore::new();
+        ts.seed(&["refactor ~2h"]);
+        ts.as_agent(|s| {
+            s.add_session(1, chrono::Duration::minutes(45), t0())
+                .unwrap();
+        });
+        let mut app = ts.app();
+        press(&mut app, "T");
+        let Mode::Input { line, .. } = &app.mode else {
+            panic!("T should prompt")
+        };
+        assert_eq!(line.text, "1h15m");
+
+        // Used up: back to the default block.
+        press(&mut app, "<Esc>");
+        ts.as_agent(|s| {
+            s.add_session(1, chrono::Duration::hours(2), t0()).unwrap();
+        });
+        app.reload();
+        press(&mut app, "T");
+        let Mode::Input { line, .. } = &app.mode else {
+            panic!("T should prompt")
+        };
+        assert_eq!(line.text, default_timer().num_minutes().to_string());
+    }
+
+    #[test]
+    fn plan_left_counts_the_running_timer() {
+        let ts = TempStore::new();
+        ts.seed(&["refactor ~1h"]);
+        let mut app = ts.app();
+        app.set_now(t0);
+        press(&mut app, "T<CR>");
+        app.set_now(t25);
+        let t = app.current().unwrap().clone();
+        assert_eq!(app.plan_left(&t), Some(chrono::Duration::minutes(35)));
+        app.set_now(t90);
+        assert_eq!(app.plan_left(&t), Some(chrono::Duration::zero()));
     }
 }

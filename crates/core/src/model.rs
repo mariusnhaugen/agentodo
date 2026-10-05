@@ -37,6 +37,9 @@ pub struct Todo {
     /// The day you plan to work on it. A soft "do-on" date, never a deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled: Option<NaiveDate>,
+    /// Time budgeted for the whole todo, across all its sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_secs: Option<u64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,6 +55,19 @@ impl Todo {
     /// Total time across finished sessions.
     pub fn time_spent(&self) -> Duration {
         self.sessions.iter().map(Session::duration).sum()
+    }
+
+    /// The time budgeted for this todo, if any.
+    pub fn plan(&self) -> Option<Duration> {
+        self.plan_secs.map(|s| Duration::seconds(s as i64))
+    }
+
+    /// What's left of the plan after the recorded time plus `running` (a
+    /// timer still going on it). Zero once the budget is used up; `None`
+    /// without a plan.
+    pub fn plan_left(&self, running: Duration) -> Option<Duration> {
+        let left = self.plan()? - self.time_spent() - running;
+        Some(left.max(Duration::zero()))
     }
 }
 
@@ -127,11 +143,12 @@ pub struct NewTodo {
     pub tags: Vec<String>,
     pub notes: Option<String>,
     pub scheduled: Option<NaiveDate>,
+    pub plan: Option<Duration>,
 }
 
 /// A partial update to an existing todo. `None` fields are left unchanged.
 ///
-/// `project`, `notes` and `scheduled` are doubly-wrapped: the outer `Option` means "was this
+/// `project`, `notes`, `scheduled` and `plan` are doubly-wrapped: the outer `Option` means "was this
 /// field mentioned at all?", the inner value (which may itself clear the field)
 /// is what to set it to.
 #[derive(Debug, Clone, Default)]
@@ -141,6 +158,7 @@ pub struct TodoPatch {
     pub project: Option<Option<String>>,
     pub notes: Option<Option<String>>,
     pub scheduled: Option<Option<NaiveDate>>,
+    pub plan: Option<Option<Duration>>,
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
 }

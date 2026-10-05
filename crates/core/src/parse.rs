@@ -1,7 +1,10 @@
+use chrono::Duration;
+
 use crate::model::Priority;
+use crate::timer::parse_duration;
 
 /// The result of parsing a one-line quick-add string such as
-/// `ship release !high +work #urgent`.
+/// `ship release !high +work #urgent ~2h`.
 ///
 /// Fields not mentioned in the input are `None`/empty so callers can tell
 /// "not specified" apart from "set to the default".
@@ -11,6 +14,7 @@ pub struct QuickAdd {
     pub priority: Option<Priority>,
     pub project: Option<String>,
     pub tags: Vec<String>,
+    pub plan: Option<Duration>,
 }
 
 /// Parses inline tokens out of a todo title.
@@ -19,8 +23,9 @@ pub struct QuickAdd {
 /// - `!high`/`!h`, `!medium`/`!m`, `!low`/`!l` — priority (last one wins)
 /// - `+name` — project (last one wins)
 /// - `#name` — tag (deduplicated, in order)
+/// - `~30m`, `~2h`, `~1h30m` — planned time (last one wins)
 ///
-/// Anything else, including unknown `!words` and a bare `+` or `#`, stays in
+/// Anything else, including unknown `!words`, `~soon` and a bare `+` or `#`, stays in
 /// the title. Tokens only count at the start of a word, so `c#` is plain text.
 pub fn parse_quick_add(input: &str) -> QuickAdd {
     let mut out = QuickAdd::default();
@@ -31,6 +36,8 @@ pub fn parse_quick_add(input: &str) -> QuickAdd {
             out.priority = Some(p);
         } else if let Some(project) = word.strip_prefix('+').filter(|s| !s.is_empty()) {
             out.project = Some(project.to_owned());
+        } else if let Some(plan) = word.strip_prefix('~').and_then(parse_duration) {
+            out.plan = Some(plan);
         } else if let Some(tag) = word.strip_prefix('#').filter(|s| !s.is_empty()) {
             if !out.tags.iter().any(|t| t == tag) {
                 out.tags.push(tag.to_owned());
@@ -92,6 +99,20 @@ mod tests {
         assert_eq!(q.priority, None);
         assert_eq!(q.project, None);
         assert!(q.tags.is_empty());
+    }
+
+    #[test]
+    fn tilde_sets_the_plan_and_junk_stays_in_the_title() {
+        let q = parse_quick_add("write docs ~1h30m +work");
+        assert_eq!(q.title, "write docs");
+        assert_eq!(q.plan, Some(Duration::minutes(90)));
+        assert_eq!(
+            parse_quick_add("x ~20 ~45m").plan,
+            Some(Duration::minutes(45))
+        );
+        let q = parse_quick_add("done ~soon ~ ~0");
+        assert_eq!(q.title, "done ~soon ~ ~0");
+        assert_eq!(q.plan, None);
     }
 
     #[test]

@@ -165,11 +165,15 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
         0
     };
 
+    let plans: Vec<Span> = app.rows.iter().map(|t| plan_text(app, t)).collect();
+    let plan_width = plans.iter().map(Span::width).max().unwrap_or(0) as u16;
+
     let search = app.search.as_deref();
     let mut rows: Vec<Row> = app
         .rows
         .iter()
-        .map(|t| {
+        .zip(plans)
+        .map(|(t, plan)| {
             let title = match editing {
                 Some((id, line)) if id == t.id => input_line(line),
                 _ => title_line(t, search),
@@ -178,7 +182,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                 Some(clock) => clock,
                 None => when_text(t, app.today),
             };
-            todo_row(t, title, app.changed.contains(&t.id), when)
+            todo_row(t, title, app.changed.contains(&t.id), when, plan)
         })
         .collect();
 
@@ -191,6 +195,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from("+".green()),
                     Cell::from(Line::from("new").right_aligned()).style(DIM),
                     Cell::from(input_line(line)),
+                    Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
@@ -209,6 +214,7 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Constraint::Length(id_width),
             Constraint::Fill(1),
             Constraint::Length(when_width),
+            Constraint::Length(plan_width),
             Constraint::Length(project_width),
             Constraint::Length(tags_width),
         ],
@@ -223,9 +229,31 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(table, area, &mut app.table);
 }
 
+/// `45m/2h`: time spent (a running timer included) against the plan, yellow
+/// once over it. Empty without a plan.
+fn plan_text(app: &App, t: &Todo) -> Span<'static> {
+    let Some(plan) = t.plan() else {
+        return Span::raw("");
+    };
+    let spent = t.time_spent() + app.running_on(t.id);
+    let text = format!("{}/{}", format_duration(spent), format_duration(plan));
+    if spent > plan {
+        Span::raw(text).yellow()
+    } else {
+        Span::styled(text, DIM)
+    }
+}
+
 /// One list row. `changed` marks a todo someone else touched since you last
-/// looked; `when` is its day, or the countdown while its timer runs.
-fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool, when: Span<'a>) -> Row<'a> {
+/// looked; `when` is its day, or the countdown while its timer runs; `plan`
+/// is time spent against its plan.
+fn todo_row<'a>(
+    t: &'a Todo,
+    title: Line<'a>,
+    changed: bool,
+    when: Span<'a>,
+    plan: Span<'a>,
+) -> Row<'a> {
     let done = t.status == Status::Done;
     let marker = if done {
         Span::raw("✓")
@@ -258,6 +286,7 @@ fn todo_row<'a>(t: &'a Todo, title: Line<'a>, changed: bool, when: Span<'a>) -> 
         Cell::from(Line::from(t.id.to_string()).right_aligned()).style(DIM),
         Cell::from(title),
         Cell::from(when),
+        Cell::from(plan),
         Cell::from(project),
         Cell::from(tags),
     ]);
@@ -377,10 +406,20 @@ fn draw_column(frame: &mut Frame, app: &App, col: usize, area: Rect) {
     if focused {
         head_style = head_style.add_modifier(Modifier::UNDERLINED);
     }
-    frame.render_widget(Line::styled(format!(" {title}"), head_style), head);
+    let cards = app.column(col);
+    // What's left to do on this day, by the open todos' plans.
+    let left: chrono::Duration = cards
+        .iter()
+        .filter(|c| c.todo.status == Status::Open)
+        .filter_map(|c| app.plan_left(&c.todo))
+        .sum();
+    let mut head_line = Line::from(Span::styled(format!(" {title}"), head_style));
+    if left > chrono::Duration::zero() {
+        head_line.push_span(Span::styled(format!(" {}", format_duration(left)), DIM));
+    }
+    frame.render_widget(head_line, head);
 
     let width = body.width.saturating_sub(1) as usize;
-    let cards = app.column(col);
     let cursor = focused.then_some(app.cursor);
     let adding = matches!(
         app.mode,
@@ -395,12 +434,16 @@ fn draw_column(frame: &mut Frame, app: &App, col: usize, area: Rect) {
         .map(|(i, card)| {
             let selected = cursor == Some(i) && !adding;
             let timer = countdown_text(app, card.todo.id);
+            let left = (card.todo.status == Status::Open)
+                .then(|| app.plan_left(&card.todo))
+                .flatten();
             card_lines(
                 card,
                 width,
                 selected,
                 app.changed.contains(&card.todo.id),
                 timer,
+                left,
             )
         })
         .collect();
@@ -441,13 +484,15 @@ fn draw_column(frame: &mut Frame, app: &App, col: usize, area: Rect) {
 }
 
 /// A card: a marker column (`•` changed, `!` high, `✓` done), then the title,
-/// slip count and running timer wrapped to at most [`CARD_LINES`] lines.
+/// slip count, running timer and what's left of its plan, wrapped to at most
+/// [`CARD_LINES`] lines.
 fn card_lines(
     card: &Card,
     width: usize,
     selected: bool,
     changed: bool,
     timer: Option<String>,
+    plan_left: Option<chrono::Duration>,
 ) -> Vec<Line<'static>> {
     let t = &card.todo;
     let done = t.status == Status::Done;
@@ -476,6 +521,13 @@ fn card_lines(
     }
     if let Some(left) = timer {
         text.push_str(&format!(" [{left}]"));
+    }
+    match plan_left {
+        Some(left) if left > chrono::Duration::zero() => {
+            text.push_str(&format!(" ~{}", format_duration(left)))
+        }
+        Some(_) => text.push_str(" ~over"),
+        None => {}
     }
     wrap(&text, width.max(1), CARD_LINES)
         .into_iter()
@@ -583,6 +635,10 @@ fn draw_focus_strip(frame: &mut Frame, app: &App, area: Rect) {
             DIM,
         ));
     }
+    let plan = plan_text(app, t);
+    if plan.width() > 0 {
+        spans.extend([Span::styled(" · ", DIM), plan]);
+    }
     frame.render_widget(Line::from(spans), area);
 }
 
@@ -644,10 +700,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             InputKind::Search { .. } => Some("/"),
             InputKind::SetProject(_) => Some("project: "),
             InputKind::TimerLength(_) => Some("focus for (minutes, or 50m / 1h30m): "),
+            InputKind::Plan(_) => None,
             InputKind::AddSession(_) => Some("add time worked, ending now (34, 1h30m): "),
             _ => None,
         };
         let length_prompt = match kind {
+            InputKind::Plan(id) => {
+                let now = app
+                    .all_todos()
+                    .iter()
+                    .find(|t| t.id == *id)
+                    .and_then(Todo::plan)
+                    .map_or("none".into(), format_duration);
+                Some(format!("plan (now {now}; empty clears): "))
+            }
             InputKind::SessionLength { id, index } => app
                 .all_todos()
                 .iter()
@@ -679,7 +745,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         (Some(m), _) if m.error => spans.push(Span::raw(m.text.as_str()).red()),
         (Some(m), _) => spans.push(Span::raw(m.text.as_str())),
         (None, Mode::Input { .. }) => spans.push(Span::styled(
-            "Enter/Esc save · !h !m !l priority · +project · #tag",
+            "Enter/Esc save · !h !m !l priority · +project · #tag · ~2h plan",
             DIM,
         )),
         (None, Mode::Log { .. }) => spans.push(Span::styled(
@@ -892,6 +958,7 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         ("gp", "set project"),
         ("e", "edit notes in $EDITOR"),
         ("T  :stop", "focus timer: start / stop"),
+        ("t", "plan time (~2h when adding)"),
         ("Enter", "details · fix time (c dd a)"),
         ("p", "filter by project"),
         (".", "show / hide done"),
@@ -929,6 +996,7 @@ const QUICK_ADD_KEYS: HelpSection = HelpSection {
     keys: &[
         ("!h !m !l", "high / medium / low"),
         ("+name", "set project"),
+        ("~2h", "plan time for it"),
         ("#name", "add a tag"),
         ("Enter Esc", "save"),
     ],
@@ -1040,6 +1108,23 @@ fn draw_detail(frame: &mut Frame, app: &App, id: u64, selected: usize) {
         lines.push(Line::from(vec![
             Span::styled(format!("{:>10}  ", "timer"), DIM),
             clock,
+        ]));
+    }
+    if let Some(plan) = t.plan() {
+        let spent = t.time_spent() + app.running_on(t.id);
+        let status = if spent > plan {
+            Span::raw(format!("{} over", format_duration(spent - plan))).yellow()
+        } else {
+            Span::raw(format!("{} left", format_duration(plan - spent)))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>10}  ", "planned"), DIM),
+            Span::raw(format!(
+                "{} · {} spent · ",
+                format_duration(plan),
+                format_duration(spent)
+            )),
+            status,
         ]));
     }
     lines.push(field("time", time_summary(t)));
@@ -1501,5 +1586,49 @@ mod tests {
         let buf = render(&mut app, 90, 40);
         assert!(row_text(&buf, 39).starts_with("length (now 9h25m): "));
         find_row(&buf, "sessions");
+    }
+
+    #[test]
+    fn plans_show_in_the_list_week_board_and_detail() {
+        let ts = TempStore::new();
+        ts.seed(&["refactor store ~2h", "write docs ~30m", "buy milk"]);
+        ts.as_agent(|s| {
+            s.add_session(1, chrono::Duration::minutes(45), nine())
+                .unwrap();
+            s.add_session(2, chrono::Duration::minutes(50), nine())
+                .unwrap();
+            for id in [1, 2, 3] {
+                s.update(
+                    id,
+                    agentodo_core::TodoPatch {
+                        scheduled: Some(Some(friday())),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+        });
+        let mut app = ts.app();
+        app.set_clock(friday);
+
+        let buf = render(&mut app, 90, 8);
+        let row = |needle| row_text(&buf, find_row(&buf, needle));
+        assert!(row("refactor store").contains("45m/2h"));
+        assert!(row("write docs").contains("50m/30m"));
+        assert!(!row("buy milk").contains('/'));
+        let over = find_row(&buf, "write docs");
+        let x = row_text(&buf, over).find("50m/30m").unwrap();
+        let x = row_text(&buf, over)[..x].chars().count() as u16;
+        assert_eq!(buf[(x, over)].fg, Color::Yellow);
+
+        press(&mut app, "W");
+        let buf = render(&mut app, 160, 12);
+        assert!(row_text(&buf, find_row(&buf, "Fri 25")).contains("Fri 25 1h15m"));
+        find_row(&buf, "~1h15m");
+        find_row(&buf, "~over");
+
+        press(&mut app, "W/refactor<CR><CR>");
+        let buf = render(&mut app, 90, 30);
+        assert!(row_text(&buf, find_row(&buf, "planned")).contains("2h · 45m spent · 1h15m left"));
     }
 }
