@@ -52,6 +52,10 @@ enum Command {
     },
     /// Stop the focus timer, recording the time so far (overtime included).
     Stop,
+    /// Pause the focus timer; the pause isn't counted as work.
+    Pause,
+    /// Resume a paused focus timer.
+    Resume,
     /// Show the running focus timer.
     Timer,
     /// List a todo's recorded sessions, or fix one.
@@ -307,7 +311,7 @@ fn main() -> Result<()> {
                     println!(
                         "stopped #{} after {}",
                         prev.todo,
-                        format_duration(now - prev.started_at)
+                        format_duration(prev.elapsed(now))
                     );
                 }
             }
@@ -332,6 +336,16 @@ fn main() -> Result<()> {
                 (None, true) => println!("null"),
                 (None, false) => println!("no timer running"),
             }
+        }
+        Command::Pause => {
+            let active = store.pause_timer(now);
+            store.save()?;
+            print_timer(&store, active.as_ref(), now, cli.json)?;
+        }
+        Command::Resume => {
+            let active = store.resume_timer(now);
+            store.save()?;
+            print_timer(&store, active.as_ref(), now, cli.json)?;
         }
         Command::Timer => print_timer(&store, store.active_timer(), now, cli.json)?,
         Command::Time(args) => {
@@ -382,14 +396,20 @@ fn duration_arg(s: &str) -> Result<chrono::Duration> {
     parse_duration(s).ok_or_else(|| anyhow!("unknown duration {s:?}: try 25, 34m or 1h30m"))
 }
 
-/// `18:42 left of 25m`, or `+01:12 over 25m` once the block is up.
+/// `18:42 left of 25m`, or `+01:12 over 25m` once the block is up, with
+/// `(paused)` while paused.
 fn timer_state(active: &ActiveSession, now: DateTime<Utc>) -> String {
-    let planned = format_duration(active.ends_at() - active.started_at);
+    let planned = format_duration(active.planned());
     let clock = format_timer(active, now);
-    if active.is_over(now) {
+    let state = if active.is_over(now) {
         format!("{clock} over {planned}")
     } else {
         format!("{clock} left of {planned}")
+    };
+    if active.is_paused() {
+        format!("{state} (paused · agentodo resume)")
+    } else {
+        state
     }
 }
 
@@ -406,8 +426,12 @@ fn print_sessions(t: &Todo, limit: usize) {
             .overtime()
             .map(|o| format!("  +{} over", format_duration(o)))
             .unwrap_or_default();
+        let paused = match s.paused_secs {
+            0 => String::new(),
+            _ => format!("  ({} paused)", format_duration(s.paused())),
+        };
         println!(
-            "  {:>3}  {}  {}–{}  {:>6}{over}",
+            "  {:>3}  {}  {}–{}  {:>6}{over}{paused}",
             n + 1,
             start.format("%a %-d %b"),
             start.format("%H:%M"),
@@ -436,9 +460,12 @@ fn print_timer(
             "todo": active.todo,
             "started_at": active.started_at,
             "planned_secs": active.planned_secs,
-            "ends_at": active.ends_at(),
+            "ends_at": active.ends_at(now),
+            "elapsed_secs": active.elapsed(now).num_seconds(),
             "remaining_secs": active.remaining(now).num_seconds(),
             "overtime_secs": active.overtime(now).num_seconds(),
+            "paused": active.is_paused(),
+            "paused_at": active.paused_at,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());

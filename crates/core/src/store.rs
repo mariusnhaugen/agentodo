@@ -415,9 +415,27 @@ impl Store {
             todo: id,
             started_at: now,
             planned_secs: length.num_seconds().max(1) as u64,
+            paused_secs: 0,
+            paused_at: None,
         };
         self.data.active_session = Some(active);
         Ok(active)
+    }
+
+    /// Pauses the running timer at `now`: its clock stands still and the
+    /// pause isn't counted as work. Returns the timer, `None` if none runs.
+    pub fn pause_timer(&mut self, now: DateTime<Utc>) -> Option<ActiveSession> {
+        let active = self.data.active_session.as_mut()?;
+        active.pause(now);
+        Some(*active)
+    }
+
+    /// Resumes a paused timer at `now`. Returns the timer, `None` if none
+    /// runs.
+    pub fn resume_timer(&mut self, now: DateTime<Utc>) -> Option<ActiveSession> {
+        let active = self.data.active_session.as_mut()?;
+        active.resume(now);
+        Some(*active)
     }
 
     /// Stops the running timer, recording the session up to `now`, overtime
@@ -427,11 +445,11 @@ impl Store {
     }
 
     /// Changes how long session `index` (oldest first) lasted, keeping its
-    /// start. For fixing a timer that was left running.
+    /// start and pauses. For fixing a timer that was left running.
     pub fn set_session_length(&mut self, id: u64, index: usize, length: Duration) -> Result<Todo> {
         self.edit_sessions(id, |sessions| {
             let session = sessions.get_mut(index)?;
-            session.end = session.start + length.max(Duration::zero());
+            session.end = session.start + session.paused() + length.max(Duration::zero());
             Some(())
         })
         .and_then(|t| t.ok_or(Error::NoSession { id, index }))
@@ -454,6 +472,7 @@ impl Store {
                 start: now - length,
                 end: now,
                 planned_secs: None,
+                paused_secs: 0,
             });
             Some(())
         })

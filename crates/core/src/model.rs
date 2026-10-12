@@ -79,11 +79,19 @@ pub struct Session {
     /// The block the timer was started for; `None` for time added by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_secs: Option<u64>,
+    /// Time the timer spent paused between `start` and `end`, not worked.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub paused_secs: u64,
 }
 
 impl Session {
+    /// Time worked: `start` to `end`, less any pauses.
     pub fn duration(&self) -> Duration {
-        self.end - self.start
+        self.end - self.start - self.paused()
+    }
+
+    pub fn paused(&self) -> Duration {
+        Duration::seconds(self.paused_secs as i64)
     }
 
     /// How far it ran past its planned block, if it did.
@@ -95,42 +103,87 @@ impl Session {
 
 /// The running focus timer. There is at most one, stored beside the todos so
 /// every frontend sees it; the countdown is derived from the clock.
+///
+/// A paused timer is still the running timer: its clock stands still from
+/// `paused_at` until it is resumed, and the pause isn't counted as work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub todo: u64,
     pub started_at: DateTime<Utc>,
     pub planned_secs: u64,
+    /// Pauses already resumed from.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub paused_secs: u64,
+    /// Set while paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<DateTime<Utc>>,
 }
 
 impl ActiveSession {
-    /// When the planned block is up. The timer keeps running past it,
-    /// counting overtime, until it is stopped.
-    pub fn ends_at(&self) -> DateTime<Utc> {
-        self.started_at + Duration::seconds(self.planned_secs as i64)
+    /// The planned block.
+    pub fn planned(&self) -> Duration {
+        Duration::seconds(self.planned_secs as i64)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    /// Time worked by `now`: the clock from the start, less pauses.
+    pub fn elapsed(&self, now: DateTime<Utc>) -> Duration {
+        let to = self.paused_at.unwrap_or(now);
+        (to - self.started_at - Duration::seconds(self.paused_secs as i64)).max(Duration::zero())
+    }
+
+    /// When the planned block is up, if it keeps running from `now`; `None`
+    /// while paused. The timer keeps running past it, counting overtime,
+    /// until it is stopped.
+    pub fn ends_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        (!self.is_paused()).then(|| now + self.planned() - self.elapsed(now))
     }
 
     /// Time left in the block at `now`, never negative.
     pub fn remaining(&self, now: DateTime<Utc>) -> Duration {
-        (self.ends_at() - now).max(Duration::zero())
+        (self.planned() - self.elapsed(now)).max(Duration::zero())
     }
 
     /// Time past the block at `now`, never negative.
     pub fn overtime(&self, now: DateTime<Utc>) -> Duration {
-        (now - self.ends_at()).max(Duration::zero())
+        (self.elapsed(now) - self.planned()).max(Duration::zero())
     }
 
     pub fn is_over(&self, now: DateTime<Utc>) -> bool {
-        now >= self.ends_at()
+        self.elapsed(now) >= self.planned()
     }
 
-    /// The session as recorded if it stops at `now`, overtime included.
+    /// Stops the clock at `now`. No-op if already paused.
+    pub fn pause(&mut self, now: DateTime<Utc>) {
+        if self.paused_at.is_none() {
+            self.paused_at = Some(now.max(self.started_at));
+        }
+    }
+
+    /// Restarts the clock at `now`. No-op unless paused.
+    pub fn resume(&mut self, now: DateTime<Utc>) {
+        if let Some(at) = self.paused_at.take() {
+            self.paused_secs += (now - at).num_seconds().max(0) as u64;
+        }
+    }
+
+    /// The session as recorded if it stops at `now`, overtime included. A
+    /// paused timer's session ends when it was paused.
     pub fn close_at(&self, now: DateTime<Utc>) -> Session {
         Session {
             start: self.started_at,
-            end: now.max(self.started_at),
+            end: self.paused_at.unwrap_or(now).max(self.started_at),
             planned_secs: Some(self.planned_secs),
+            paused_secs: self.paused_secs,
         }
     }
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Fields supplied when creating a new todo. The store fills in `id` and

@@ -148,7 +148,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "get_timer",
-            "description": "The user's running focus timer: which todo they're working on, how long is left in the planned block, and how far past it they've gone (overtime_secs). The timer keeps running until the user stops it. Returns null when no timer is running. Read-only; the user starts and stops timers themselves.",
+            "description": "The user's running focus timer: which todo they're working on, how long is left in the planned block, and how far past it they've gone (overtime_secs). While paused (paused: true) the clock stands still and ends_at is null. The timer keeps running until the user stops it. Returns null when no timer is running. Read-only; the user starts and stops timers themselves.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -298,9 +298,12 @@ fn get_timer(_args: &Value) -> Result<Value, String> {
         "title": store.get(active.todo).map(|t| t.title.clone()),
         "started_at": active.started_at,
         "planned_secs": active.planned_secs,
-        "ends_at": active.ends_at(),
+        "ends_at": active.ends_at(now),
+        "elapsed_secs": active.elapsed(now).num_seconds(),
         "remaining_secs": active.remaining(now).num_seconds(),
         "overtime_secs": active.overtime(now).num_seconds(),
+        "paused": active.is_paused(),
+        "paused_at": active.paused_at,
     }))
 }
 

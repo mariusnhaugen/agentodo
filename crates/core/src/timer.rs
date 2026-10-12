@@ -62,12 +62,17 @@ pub fn format_countdown(d: Duration) -> String {
 }
 
 /// A running timer's clock: time left in the block (`18:42`), then the
-/// overtime past it (`+01:12`, `+9:25:33`).
+/// overtime past it (`+01:12`, `+9:25:33`). Paused, it leads with `⏸`.
 pub fn format_timer(active: &ActiveSession, now: DateTime<Utc>) -> String {
-    if active.is_over(now) {
+    let clock = if active.is_over(now) {
         format!("+{}", format_countdown(active.overtime(now)))
     } else {
         format_countdown(active.remaining(now))
+    };
+    if active.is_paused() {
+        format!("⏸ {clock}")
+    } else {
+        clock
     }
 }
 
@@ -105,11 +110,35 @@ mod tests {
             todo: 1,
             started_at: start,
             planned_secs: 25 * 60,
+            paused_secs: 0,
+            paused_at: None,
         };
         let at = |secs| start + Duration::seconds(secs);
         assert_eq!(format_timer(&active, at(378)), "18:42");
         assert_eq!(format_timer(&active, at(1500)), "+00:00");
         assert_eq!(format_timer(&active, at(1500 + 72)), "+01:12");
         assert_eq!(format_timer(&active, at(1500 + 33933)), "+9:25:33");
+    }
+
+    #[test]
+    fn a_paused_timer_stands_still() {
+        let start: DateTime<Utc> = "2026-10-05T09:00:00Z".parse().unwrap();
+        let at = |secs| start + Duration::seconds(secs);
+        let mut active = ActiveSession {
+            todo: 1,
+            started_at: start,
+            planned_secs: 25 * 60,
+            paused_secs: 0,
+            paused_at: None,
+        };
+        active.pause(at(378));
+        assert_eq!(format_timer(&active, at(378)), "⏸ 18:42");
+        assert_eq!(format_timer(&active, at(5000)), "⏸ 18:42");
+        assert_eq!(active.ends_at(at(5000)), None);
+
+        active.resume(at(978));
+        assert_eq!(format_timer(&active, at(978)), "18:42");
+        assert_eq!(active.ends_at(at(978)), Some(at(2100)));
+        assert_eq!(format_timer(&active, at(2100 + 72)), "+01:12");
     }
 }

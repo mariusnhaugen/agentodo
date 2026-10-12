@@ -246,8 +246,9 @@ pub struct App {
     clock: fn() -> NaiveDate,
     /// The running focus timer as of the last load.
     pub timer: Option<ActiveSession>,
-    /// The timer whose end-of-block bell has gone, so it rings only once.
-    rung: Option<ActiveSession>,
+    /// The timer (todo, start) whose end-of-block bell has gone, so it
+    /// rings only once, pauses and all.
+    rung: Option<(u64, DateTime<Utc>)>,
     now: fn() -> DateTime<Utc>,
 }
 
@@ -423,17 +424,18 @@ impl App {
     pub fn tick(&mut self) -> Option<Todo> {
         let now = self.now();
         let timer = self.timer.filter(|t| t.is_over(now))?;
-        if self.rung == Some(timer) {
+        let key = (timer.todo, timer.started_at);
+        if self.rung == Some(key) {
             return None;
         }
-        self.rung = Some(timer);
-        if now - timer.ends_at() >= STALE_ALERT {
+        self.rung = Some(key);
+        if timer.overtime(now) >= STALE_ALERT {
             return None;
         }
         let todo = self.all.iter().find(|t| t.id == timer.todo)?.clone();
         self.info(format!(
             "⏱ {} up on #{} {} — counting overtime · T stops",
-            format_duration(timer.ends_at() - timer.started_at),
+            format_duration(timer.planned()),
             todo.id,
             todo.title
         ));
@@ -466,9 +468,7 @@ impl App {
     pub fn running_on(&self, id: u64) -> chrono::Duration {
         self.timer
             .filter(|t| t.todo == id)
-            .map_or(chrono::Duration::zero(), |t| {
-                (self.now() - t.started_at).max(chrono::Duration::zero())
-            })
+            .map_or(chrono::Duration::zero(), |t| t.elapsed(self.now()))
     }
 
     /// What's left of `t`'s plan, counting a timer running on it.
@@ -525,6 +525,37 @@ impl App {
                 }
                 self.info(text);
             }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// `P`, `:pause`: pause the running timer, or resume it if paused.
+    fn pause_timer(&mut self, pause: Option<bool>) {
+        let Some(timer) = self.timer else {
+            return self.info("no timer running");
+        };
+        let pause = pause.unwrap_or(!timer.is_paused());
+        let now = self.now();
+        let result = self.repo.with_store(|s| {
+            Ok(if pause {
+                s.pause_timer(now)
+            } else {
+                s.resume_timer(now)
+            })
+        });
+        self.reload();
+        match result {
+            Ok(Some(t)) if t.is_paused() => self.info(format!(
+                "⏸ paused #{} at {} · P resumes",
+                t.todo,
+                format_duration(t.elapsed(now))
+            )),
+            Ok(Some(t)) => self.info(format!(
+                "⏱ resumed #{} · {}",
+                t.todo,
+                agentodo_core::format_timer(&t, now)
+            )),
+            Ok(None) => self.info("no timer running"),
             Err(e) => self.error(format!("{e:#}")),
         }
     }
@@ -1003,6 +1034,7 @@ impl App {
             }),
             KeyCode::Char('x') => self.toggle_done(),
             KeyCode::Char('T') => self.timer_key(),
+            KeyCode::Char('P') => self.pause_timer(None),
             KeyCode::Char('t') => {
                 self.start_input_on_current(|t| (InputKind::Plan(t.id), LineEdit::default()))
             }
@@ -1397,6 +1429,8 @@ impl App {
             }
             "show" => self.set_show_done(true),
             "stop" => self.stop_timer(),
+            "pause" => self.pause_timer(Some(true)),
+            "resume" => self.pause_timer(Some(false)),
             "project" | "proj" => self.set_project_filter(if arg.is_empty() {
                 ProjectFilter::All
             } else {
@@ -2671,6 +2705,40 @@ pub(crate) mod tests {
 
         press(&mut app, ":stop<CR>");
         assert_eq!(app.timer, None);
+    }
+
+    #[test]
+    fn p_pauses_and_resumes_and_the_pause_is_not_counted() {
+        let ts = TempStore::new();
+        ts.seed(&["focus"]);
+        let mut app = ts.app();
+        press(&mut app, "P");
+        assert_eq!(app.message.as_ref().unwrap().text, "no timer running");
+
+        app.set_now(t0);
+        press(&mut app, "T<CR>");
+        app.set_now(t10);
+        press(&mut app, "P");
+        assert!(app.timer.unwrap().is_paused());
+        assert!(app
+            .message
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("paused #1 at 10m"));
+
+        app.set_now(t25);
+        assert_eq!(app.tick(), None, "a paused block never runs out");
+        press(&mut app, ":pause<CR>");
+        assert!(app.timer.unwrap().is_paused(), ":pause doesn't toggle");
+        press(&mut app, "P");
+        assert!(!app.timer.unwrap().is_paused());
+        assert_eq!(app.running_on(1).num_minutes(), 10);
+
+        app.set_now(t90);
+        press(&mut app, "T");
+        assert_eq!(spent(&ts, 1), 75);
+        assert!(app.message.as_ref().unwrap().text.contains("after 1h15m"));
     }
 
     #[test]

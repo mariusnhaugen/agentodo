@@ -68,6 +68,8 @@ agentodo edit 2 --plan none            # drop the budget
 agentodo start 1             # focus timer on #1: what's left of its plan, else 25m
 agentodo start 1 50m         # or 50, 1h, 1h30m
 agentodo timer               # what's running: time left, or +01:12 over
+agentodo pause               # interrupted? the clock stands still
+agentodo resume              # and picks up where it left off
 agentodo stop                # record the time, overtime included
 
 agentodo time 1              # list #1's sessions, newest first
@@ -101,6 +103,7 @@ the app for the full list.
 | `:q` `:project [name]` `:sort priority\|created` `:hide` `:show` | commands |
 | `]c` `[c`, `:log`, `:seen` | jump between changed todos, change log, clear markers |
 | `T`, `:stop` | start a focus timer on this todo (asks how long) / stop it |
+| `P`, `:pause` `:resume` | pause / resume the timer |
 | `t` | plan time for this todo (`45m`, `2h`); empty clears it |
 | `Enter`, then `c` `dd` `a` | details, then change / delete / add time on the selected session |
 | `W`, `:week` `:list` | switch between the list and the week board |
@@ -143,6 +146,10 @@ you quit the TUI, and the CLI, TUI and agents all see the same timer.
 - **Stopping records the time**, overtime included. `T` or `:stop` stops it,
   so does marking the todo done, and starting a timer on another todo
   switches. Deleting the todo drops it.
+- **Pause for interruptions.** `P` (or `agentodo pause`) stops the clock
+  without ending the session; `P` again resumes it. The pause isn't counted
+  as work or toward overtime, and the session lists it (`10m paused`).
+  Stopping while paused records the time up to the pause.
 - **Fix it afterwards.** If you walked away and the timer ran all night,
   correct the session instead of losing it. In the TUI, `Enter` on a todo
   lists its sessions newest first, with overtime called out. The newest
@@ -155,7 +162,7 @@ you quit the TUI, and the CLI, TUI and agents all see the same timer.
 
 While a timer runs, the TUI header shows `⏱ 18:42 #3 title`, and the todo's
 row (or its card on the week board) counts down, then counts up in yellow
-once it's in overtime. When the block is up, the TUI shows a banner and rings
+once it's in overtime. Paused, it shows `⏸ 18:42` dimmed. When the block is up, the TUI shows a banner and rings
 the terminal bell. Windows Terminal turns the bell into a taskbar flash. To
 get a desktop notification as well, set `$AGENTODO_TIMER_HOOK` to a shell
 command. It runs with `$AGENTODO_TODO_ID` and `$AGENTODO_TODO_TITLE` set.

@@ -607,6 +607,45 @@ mod tests {
     }
 
     #[test]
+    fn pauses_are_not_counted_as_work() {
+        let mut store = Store::load("/nonexistent/ignored.json").unwrap();
+        let t = store.add(NewTodo::default());
+        assert_eq!(store.pause_timer(at(0)), None, "nothing to pause");
+
+        store.start_timer(t.id, mins(25), at(0)).unwrap();
+        let paused = store.pause_timer(at(10)).unwrap();
+        assert!(paused.is_paused());
+        assert_eq!(paused.remaining(at(40)), mins(15), "the clock stands still");
+        assert_eq!(
+            store.pause_timer(at(20)),
+            Some(paused),
+            "pausing twice is a no-op"
+        );
+
+        let resumed = store.resume_timer(at(30)).unwrap();
+        assert!(!resumed.is_paused());
+        assert_eq!(resumed.remaining(at(35)), mins(10));
+        assert_eq!(resumed.overtime(at(50)), mins(5));
+
+        let done = store.stop_timer(at(50)).unwrap();
+        let session = done.sessions[0];
+        assert_eq!((session.start, session.end), (at(0), at(50)));
+        assert_eq!(session.duration(), mins(30));
+        assert_eq!(session.overtime(), Some(mins(5)));
+
+        // Fixing the length keeps the pause out of it.
+        let fixed = store.set_session_length(t.id, 0, mins(20)).unwrap();
+        assert_eq!(fixed.sessions[0].end, at(40));
+        assert_eq!(fixed.sessions[0].duration(), mins(20));
+
+        // Stopping while paused records up to the pause.
+        store.start_timer(t.id, mins(25), at(100)).unwrap();
+        store.pause_timer(at(112));
+        let t = store.stop_timer(at(500)).unwrap();
+        assert_eq!(t.sessions[1].duration(), mins(12));
+    }
+
+    #[test]
     fn recorded_sessions_can_be_shortened_deleted_and_added() {
         let path = temp_store_path("edit-sessions");
         let mut store = Store::load(&path).unwrap();

@@ -342,11 +342,14 @@ fn countdown_text(app: &App, id: u64) -> Option<String> {
     Some(format_timer(&timer, app.now()))
 }
 
-/// [`countdown_text`], green while in the block and yellow in overtime.
+/// [`countdown_text`], green while in the block, yellow in overtime and
+/// dimmed while paused.
 fn countdown(app: &App, id: u64) -> Option<Span<'static>> {
     let text = countdown_text(app, id)?;
-    let over = app.timer.is_some_and(|t| t.is_over(app.now()));
-    Some(if over {
+    let timer = app.timer?;
+    Some(if timer.is_paused() {
+        Span::styled(text, DIM)
+    } else if timer.is_over(app.now()) {
         Span::raw(text).yellow().bold()
     } else {
         Span::raw(text).green().bold()
@@ -958,6 +961,7 @@ const AGENTODO_KEYS: HelpSection = HelpSection {
         ("gp", "set project"),
         ("e", "edit notes in $EDITOR"),
         ("T  :stop", "focus timer: start / stop"),
+        ("P  :pause :resume", "pause / resume the timer"),
         ("t", "plan time (~2h when adding)"),
         ("Enter", "details · fix time (c dd a)"),
         ("p", "filter by project"),
@@ -1196,6 +1200,12 @@ fn session_lines(t: &Todo, selected: usize) -> Vec<Line<'static>> {
         ];
         if let Some(over) = s.overtime() {
             spans.push(Span::raw(format!("  +{} over", format_duration(over))).yellow());
+        }
+        if s.paused_secs > 0 {
+            spans.push(Span::styled(
+                format!("  ({} paused)", format_duration(s.paused())),
+                DIM,
+            ));
         }
         let line = Line::from(spans);
         lines.push(if i == selected {
