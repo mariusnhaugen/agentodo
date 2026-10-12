@@ -25,6 +25,22 @@ Todos live in a single JSON file. Resolution order:
 Writes are atomic (temp file + rename), so an interrupted write can't corrupt the
 store.
 
+### Your data
+
+Two files next to each other hold everything: `todos.json` (todos and their
+recorded time) and `todos.log.jsonl` (the [change log](#change-log)). The log
+is the full history, including deleted todos and the time recorded on them, so
+never delete it. Neither file is backed up for you: to keep years of history
+safe, point `$AGENTODO_STORE` at a synced or backed-up folder (the log follows
+the store).
+
+For scripting, `agentodo list --status all --json` prints every todo with its
+`sessions`. Each session has `start` and `end` (UTC, whole seconds),
+`paused_secs` (time worked is `end - start - paused_secs`), `planned_secs`
+(the timer's block; absent for time added by hand), and the `project` and
+`tags` the todo had when the session was recorded, so moving a todo later
+doesn't re-file its past time.
+
 ## Install
 
 ```sh

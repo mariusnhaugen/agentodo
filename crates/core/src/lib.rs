@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(resumed.overtime(at(50)), mins(5));
 
         let done = store.stop_timer(at(50)).unwrap();
-        let session = done.sessions[0];
+        let session = &done.sessions[0];
         assert_eq!((session.start, session.end), (at(0), at(50)));
         assert_eq!(session.duration(), mins(30));
         assert_eq!(session.overtime(), Some(mins(5)));
@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn done_stops_the_timer_and_delete_drops_it() {
+    fn done_and_delete_stop_the_timer_and_keep_its_time() {
         let mut store = Store::load("/nonexistent/ignored.json").unwrap();
         let a = store.add(NewTodo::default());
         let b = store.add(NewTodo::default());
@@ -742,10 +742,59 @@ mod tests {
         assert!(done.time_spent() >= mins(40), "overtime counts");
         assert_eq!(store.active_timer(), None);
 
-        store.start_timer(a.id, mins(25), at(0)).unwrap();
+        store
+            .start_timer(a.id, mins(25), chrono::Utc::now() - mins(10))
+            .unwrap();
         let removed = store.delete(a.id).unwrap();
-        assert!(removed.sessions.is_empty());
+        assert_eq!(removed.sessions.len(), 1, "the deleted todo keeps the time");
+        assert!(removed.time_spent() >= mins(10));
         assert_eq!(store.active_timer(), None);
+    }
+
+    #[test]
+    fn sessions_stay_filed_under_the_project_they_were_worked_in() {
+        let path = temp_store_path("filed");
+        let mut store = Store::load(&path).unwrap();
+        let t = store.add(NewTodo {
+            project: Some("apps".into()),
+            tags: vec!["cv".into()],
+            ..Default::default()
+        });
+        store.start_timer(t.id, mins(25), at(0)).unwrap();
+        store.stop_timer(at(25)).unwrap();
+
+        store
+            .update(
+                t.id,
+                TodoPatch {
+                    project: Some(Some("python".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.add_session(t.id, mins(30), at(100)).unwrap();
+        store.start_timer(t.id, mins(25), at(200)).unwrap();
+        let done = store.set_status(t.id, Status::Done).unwrap();
+
+        let projects: Vec<_> = done.sessions.iter().map(|s| s.project.as_deref()).collect();
+        assert_eq!(projects, [Some("apps"), Some("python"), Some("python")]);
+        assert_eq!(done.sessions[0].tags, ["cv"]);
+
+        // Session edits leave the filing alone.
+        let fixed = store.set_session_length(t.id, 0, mins(20)).unwrap();
+        assert_eq!(fixed.sessions[0].project.as_deref(), Some("apps"));
+
+        // Whole seconds, so `fromisoformat` and jq can read them.
+        let sub = chrono::Duration::milliseconds(456);
+        store.start_timer(t.id, mins(25), at(1000) + sub).unwrap();
+        let t = store.stop_timer(at(1010) + sub).unwrap();
+        let last = t.sessions.last().unwrap();
+        assert_eq!((last.start, last.end), (at(1000), at(1010)));
+        store.save().unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(json.contains(r#""project": "apps""#));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
     #[test]

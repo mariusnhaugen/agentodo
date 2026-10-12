@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -321,7 +321,7 @@ impl Store {
 
     /// Sets a todo's status, maintaining `completed_at`.
     pub fn set_status(&mut self, id: u64, status: Status) -> Result<Todo> {
-        let now = Utc::now();
+        let now = Utc::now().trunc_subsecs(0);
         let todo = self
             .data
             .todos
@@ -333,7 +333,7 @@ impl Store {
         // Finishing a todo ends its focus session; the time so far counts.
         if status == Status::Done {
             if let Some(active) = self.data.active_session.filter(|a| a.todo == id) {
-                todo.sessions.push(active.close_at(now));
+                todo.sessions.push(filed(todo, active.close_at(now)));
                 self.data.active_session = None;
             }
         }
@@ -348,7 +348,8 @@ impl Store {
         Ok(after)
     }
 
-    /// Removes a todo by id, returning it.
+    /// Removes a todo by id, returning it. A timer running on it stops, its
+    /// time recorded on the removed todo, so the log keeps it.
     pub fn delete(&mut self, id: u64) -> Result<Todo> {
         let pos = self
             .data
@@ -356,8 +357,12 @@ impl Store {
             .iter()
             .position(|t| t.id == id)
             .ok_or(Error::NotFound(id))?;
-        let todo = self.data.todos.remove(pos);
-        if self.data.active_session.is_some_and(|a| a.todo == id) {
+        let mut todo = self.data.todos.remove(pos);
+        if let Some(active) = self.data.active_session.filter(|a| a.todo == id) {
+            let session = active.close_at(Utc::now().trunc_subsecs(0));
+            if session.duration() > Duration::zero() {
+                todo.sessions.push(filed(&todo, session));
+            }
             self.data.active_session = None;
         }
         self.record("delete", id, Some(todo.clone()), None);
@@ -420,6 +425,7 @@ impl Store {
         if self.get(id).is_none() {
             return Err(Error::NotFound(id));
         }
+        let now = now.trunc_subsecs(0);
         self.close_active(now);
         let active = ActiveSession {
             todo: id,
@@ -438,7 +444,7 @@ impl Store {
     /// pause isn't counted as work. Returns the timer, `None` if none runs.
     pub fn pause_timer(&mut self, now: DateTime<Utc>) -> Option<ActiveSession> {
         let active = self.data.active_session.as_mut()?;
-        active.pause(now);
+        active.pause(now.trunc_subsecs(0));
         Some(*active)
     }
 
@@ -446,14 +452,14 @@ impl Store {
     /// runs.
     pub fn resume_timer(&mut self, now: DateTime<Utc>) -> Option<ActiveSession> {
         let active = self.data.active_session.as_mut()?;
-        active.resume(now);
+        active.resume(now.trunc_subsecs(0));
         Some(*active)
     }
 
     /// Stops the running timer, recording the session up to `now`, overtime
     /// included. Returns the todo it was recorded on.
     pub fn stop_timer(&mut self, now: DateTime<Utc>) -> Option<Todo> {
-        self.close_active(now)
+        self.close_active(now.trunc_subsecs(0))
     }
 
     /// Changes how long session `index` (oldest first) lasted, keeping its
@@ -479,13 +485,21 @@ impl Store {
 
     /// Records `length` of work done without the timer, ending at `now`.
     pub fn add_session(&mut self, id: u64, length: Duration, now: DateTime<Utc>) -> Result<Todo> {
-        self.edit_sessions(id, |sessions| {
-            sessions.push(Session {
-                start: now - length,
+        let now = now.trunc_subsecs(0);
+        let todo = self.get(id).ok_or(Error::NotFound(id))?;
+        let session = filed(
+            todo,
+            Session {
+                start: now - Duration::seconds(length.num_seconds()),
                 end: now,
                 planned_secs: None,
                 paused_secs: 0,
-            });
+                project: None,
+                tags: Vec::new(),
+            },
+        );
+        self.edit_sessions(id, |sessions| {
+            sessions.push(session);
             Some(())
         })
         .map(|t| t.expect("pushing always succeeds"))
@@ -534,11 +548,20 @@ impl Store {
         }
         let todo = self.data.todos.iter_mut().find(|t| t.id == active.todo)?;
         let before = todo.clone();
-        todo.sessions.push(session);
+        todo.sessions.push(filed(todo, session));
         todo.updated_at = now;
         let after = todo.clone();
         self.record("session", active.todo, Some(before), Some(after.clone()));
         Some(after)
+    }
+}
+
+/// `session` filed under `todo`'s project and tags as they are now.
+fn filed(todo: &Todo, session: Session) -> Session {
+    Session {
+        project: todo.project.clone(),
+        tags: todo.tags.clone(),
+        ..session
     }
 }
 

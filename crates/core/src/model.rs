@@ -72,7 +72,7 @@ impl Todo {
 }
 
 /// One finished stretch of work on a todo.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
@@ -82,6 +82,13 @@ pub struct Session {
     /// Time the timer spent paused between `start` and `end`, not worked.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub paused_secs: u64,
+    /// The todo's project when the session was recorded. Moving the todo
+    /// later leaves it be, so past time stays filed where it was worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// The todo's tags when the session was recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl Session {
@@ -213,13 +220,16 @@ impl ActiveSession {
     }
 
     /// The session as recorded if it stops at `now`, overtime included. A
-    /// paused timer's session ends when it was paused.
+    /// paused timer's session ends when it was paused. The store files it
+    /// under its todo's project and tags.
     pub fn close_at(&self, now: DateTime<Utc>) -> Session {
         Session {
             start: self.started_at,
             end: self.paused_since(now).unwrap_or(now).max(self.started_at),
             planned_secs: Some(self.planned_secs),
             paused_secs: self.paused_secs,
+            project: None,
+            tags: Vec::new(),
         }
     }
 }
