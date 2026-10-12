@@ -148,7 +148,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "get_timer",
-            "description": "The user's running focus timer: which todo they're working on, how long is left in the planned block, and how far past it they've gone (overtime_secs). While paused (paused: true) the clock stands still and ends_at is null. The timer keeps running until the user stops it. Returns null when no timer is running. Read-only; the user starts and stops timers themselves.",
+            "description": "The user's running focus timer: which todo they're working on, how long is left in the planned block, and how far past it they've gone (overtime_secs). While paused (paused: true) the clock stands still and ends_at is null; auto_paused means it paused itself after running too long in overtime unattended. The timer keeps running until the user stops it. Returns null when no timer is running. Read-only; the user starts and stops timers themselves.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -302,8 +302,9 @@ fn get_timer(_args: &Value) -> Result<Value, String> {
         "elapsed_secs": active.elapsed(now).num_seconds(),
         "remaining_secs": active.remaining(now).num_seconds(),
         "overtime_secs": active.overtime(now).num_seconds(),
-        "paused": active.is_paused(),
-        "paused_at": active.paused_at,
+        "paused": active.is_paused(now),
+        "auto_paused": active.is_auto_paused(now),
+        "paused_at": active.paused_at.or(active.auto_pause_at().filter(|at| *at <= now)),
     }))
 }
 

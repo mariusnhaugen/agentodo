@@ -150,6 +150,13 @@ you quit the TUI, and the CLI, TUI and agents all see the same timer.
   without ending the session; `P` again resumes it. The pause isn't counted
   as work or toward overtime, and the session lists it (`10m paused`).
   Stopping while paused records the time up to the pause.
+- **A forgotten timer pauses itself** an hour into overtime, as though you'd
+  paused it then, so a timer left running over the weekend records 1h of
+  overtime, not three days. It doesn't matter whether anything was open at
+  the time. Resume it (`P`) if you really were still working: you get
+  another hour from then. Set `$AGENTODO_TIMER_MAX_OVER` to change the limit
+  (`2h`, `30m`) or to `off` to let timers run on until stopped. The limit is
+  fixed when a timer starts.
 - **Fix it afterwards.** If you walked away and the timer ran all night,
   correct the session instead of losing it. In the TUI, `Enter` on a todo
   lists its sessions newest first, with overtime called out. The newest
@@ -174,7 +181,8 @@ export AGENTODO_TIMER_HOOK='powershell.exe -NoProfile -Command "New-BurntToastNo
 
 The bell only rings from an open TUI, and only if the block ended in the
 last minute. A TUI opened later just shows the overtime. Set
-`$AGENTODO_TIMER_MINUTES` to change the default block (e.g. `30`).
+`$AGENTODO_TIMER_MINUTES` to change the default block (e.g. `30`), and
+`$AGENTODO_TIMER_MAX_OVER` the overtime limit (default `1h`, or `off`).
 
 ### Planning time
 

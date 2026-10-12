@@ -347,7 +347,7 @@ fn countdown_text(app: &App, id: u64) -> Option<String> {
 fn countdown(app: &App, id: u64) -> Option<Span<'static>> {
     let text = countdown_text(app, id)?;
     let timer = app.timer?;
-    Some(if timer.is_paused() {
+    Some(if timer.is_paused(app.now()) {
         Span::styled(text, DIM)
     } else if timer.is_over(app.now()) {
         Span::raw(text).yellow().bold()
@@ -1560,6 +1560,7 @@ mod tests {
         let ts = TempStore::new();
         ts.seed(&["refactor store"]);
         ts.as_agent(|s| {
+            s.set_max_overtime(None);
             for _ in 0..12 {
                 s.add_session(1, chrono::Duration::minutes(5), nine())
                     .unwrap();

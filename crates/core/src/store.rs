@@ -45,6 +45,8 @@ pub struct Store {
     actor: Actor,
     /// Log entries for mutations not yet saved.
     pending: Vec<LogEntry>,
+    /// The overtime limit given to timers started from here.
+    max_overtime: Option<Duration>,
 }
 
 impl Store {
@@ -88,6 +90,7 @@ impl Store {
             data,
             actor: Actor::default(),
             pending: Vec::new(),
+            max_overtime: crate::timer::max_overtime(),
         })
     }
 
@@ -399,6 +402,13 @@ impl Store {
         self.data.active_session.as_ref()
     }
 
+    /// Sets how far into overtime timers started from now on run before
+    /// pausing themselves (`None`: never). Defaults to
+    /// [`max_overtime`](crate::max_overtime).
+    pub fn set_max_overtime(&mut self, limit: Option<Duration>) {
+        self.max_overtime = limit;
+    }
+
     /// Starts a focus timer with a planned block of `length` on todo `id`.
     /// A timer already running (on any todo) is stopped first and recorded.
     pub fn start_timer(
@@ -417,6 +427,8 @@ impl Store {
             planned_secs: length.num_seconds().max(1) as u64,
             paused_secs: 0,
             paused_at: None,
+            max_over_secs: self.max_overtime.map(|d| d.num_seconds().max(0) as u64),
+            resumed_at: None,
         };
         self.data.active_session = Some(active);
         Ok(active)

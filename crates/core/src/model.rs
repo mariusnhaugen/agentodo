@@ -106,6 +106,11 @@ impl Session {
 ///
 /// A paused timer is still the running timer: its clock stands still from
 /// `paused_at` until it is resumed, and the pause isn't counted as work.
+///
+/// A timer left running pauses itself `max_over_secs` into overtime (or
+/// that long after a resume, if later), as though paused right then. It's
+/// derived from the clock like the countdown, so it holds whether or not
+/// anything was watching when it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSession {
     pub todo: u64,
@@ -114,9 +119,16 @@ pub struct ActiveSession {
     /// Pauses already resumed from.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub paused_secs: u64,
-    /// Set while paused.
+    /// Set while paused by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_at: Option<DateTime<Utc>>,
+    /// How long it may run unattended in overtime before pausing itself;
+    /// `None` runs on until stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_over_secs: Option<u64>,
+    /// The last resume, which restarts the unattended allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<DateTime<Utc>>,
 }
 
 impl ActiveSession {
@@ -125,13 +137,38 @@ impl ActiveSession {
         Duration::seconds(self.planned_secs as i64)
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.paused_at.is_some()
+    /// When a running timer pauses itself, `None` without a limit or once
+    /// paused by hand.
+    pub fn auto_pause_at(&self) -> Option<DateTime<Utc>> {
+        if self.paused_at.is_some() {
+            return None;
+        }
+        let limit = Duration::seconds(self.max_over_secs? as i64);
+        let block_end =
+            self.started_at + Duration::seconds(self.paused_secs as i64) + self.planned();
+        let from = self.resumed_at.map_or(block_end, |r| r.max(block_end));
+        Some(from + limit)
+    }
+
+    /// When the clock stopped, if it's stopped at `now`: paused by hand, or
+    /// paused itself.
+    fn paused_since(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.paused_at
+            .or(self.auto_pause_at().filter(|at| *at <= now))
+    }
+
+    pub fn is_paused(&self, now: DateTime<Utc>) -> bool {
+        self.paused_since(now).is_some()
+    }
+
+    /// Paused itself, having run past its overtime limit.
+    pub fn is_auto_paused(&self, now: DateTime<Utc>) -> bool {
+        self.paused_at.is_none() && self.is_paused(now)
     }
 
     /// Time worked by `now`: the clock from the start, less pauses.
     pub fn elapsed(&self, now: DateTime<Utc>) -> Duration {
-        let to = self.paused_at.unwrap_or(now);
+        let to = self.paused_since(now).unwrap_or(now);
         (to - self.started_at - Duration::seconds(self.paused_secs as i64)).max(Duration::zero())
     }
 
@@ -139,7 +176,7 @@ impl ActiveSession {
     /// while paused. The timer keeps running past it, counting overtime,
     /// until it is stopped.
     pub fn ends_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        (!self.is_paused()).then(|| now + self.planned() - self.elapsed(now))
+        (!self.is_paused(now)).then(|| now + self.planned() - self.elapsed(now))
     }
 
     /// Time left in the block at `now`, never negative.
@@ -156,17 +193,22 @@ impl ActiveSession {
         self.elapsed(now) >= self.planned()
     }
 
-    /// Stops the clock at `now`. No-op if already paused.
+    /// Stops the clock at `now`, or where it already stopped if it paused
+    /// itself. No-op if already paused by hand.
     pub fn pause(&mut self, now: DateTime<Utc>) {
         if self.paused_at.is_none() {
-            self.paused_at = Some(now.max(self.started_at));
+            let at = self.paused_since(now).unwrap_or(now);
+            self.paused_at = Some(at.max(self.started_at));
         }
     }
 
-    /// Restarts the clock at `now`. No-op unless paused.
+    /// Restarts the clock at `now`, with a fresh overtime allowance. No-op
+    /// unless paused.
     pub fn resume(&mut self, now: DateTime<Utc>) {
-        if let Some(at) = self.paused_at.take() {
+        if let Some(at) = self.paused_since(now) {
             self.paused_secs += (now - at).num_seconds().max(0) as u64;
+            self.paused_at = None;
+            self.resumed_at = Some(now);
         }
     }
 
@@ -175,7 +217,7 @@ impl ActiveSession {
     pub fn close_at(&self, now: DateTime<Utc>) -> Session {
         Session {
             start: self.started_at,
-            end: self.paused_at.unwrap_or(now).max(self.started_at),
+            end: self.paused_since(now).unwrap_or(now).max(self.started_at),
             planned_secs: Some(self.planned_secs),
             paused_secs: self.paused_secs,
         }

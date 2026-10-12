@@ -12,6 +12,16 @@ pub fn default_timer() -> Duration {
         .map_or(Duration::minutes(25), Duration::minutes)
 }
 
+/// How long a timer may run in overtime before pausing itself:
+/// `$AGENTODO_TIMER_MAX_OVER` (`2h`, `90`, or `off` for never), else an hour.
+pub fn max_overtime() -> Option<Duration> {
+    match std::env::var("AGENTODO_TIMER_MAX_OVER") {
+        Ok(v) if matches!(v.trim(), "off" | "none" | "0") => None,
+        Ok(v) => Some(parse_duration(&v).unwrap_or(Duration::hours(1))),
+        Err(_) => Some(Duration::hours(1)),
+    }
+}
+
 /// Parses a session length: a bare number of minutes (`25`) or units
 /// (`50m`, `1h`, `1h30m`, `90s`). Zero and negative lengths are rejected.
 pub fn parse_duration(s: &str) -> Option<Duration> {
@@ -69,7 +79,7 @@ pub fn format_timer(active: &ActiveSession, now: DateTime<Utc>) -> String {
     } else {
         format_countdown(active.remaining(now))
     };
-    if active.is_paused() {
+    if active.is_paused(now) {
         format!("⏸ {clock}")
     } else {
         clock
@@ -112,6 +122,8 @@ mod tests {
             planned_secs: 25 * 60,
             paused_secs: 0,
             paused_at: None,
+            max_over_secs: None,
+            resumed_at: None,
         };
         let at = |secs| start + Duration::seconds(secs);
         assert_eq!(format_timer(&active, at(378)), "18:42");
@@ -130,6 +142,8 @@ mod tests {
             planned_secs: 25 * 60,
             paused_secs: 0,
             paused_at: None,
+            max_over_secs: None,
+            resumed_at: None,
         };
         active.pause(at(378));
         assert_eq!(format_timer(&active, at(378)), "⏸ 18:42");
@@ -140,5 +154,54 @@ mod tests {
         assert_eq!(format_timer(&active, at(978)), "18:42");
         assert_eq!(active.ends_at(at(978)), Some(at(2100)));
         assert_eq!(format_timer(&active, at(2100 + 72)), "+01:12");
+    }
+
+    #[test]
+    fn a_timer_left_running_pauses_itself() {
+        let start: DateTime<Utc> = "2026-10-05T09:00:00Z".parse().unwrap();
+        let at = |mins| start + Duration::minutes(mins);
+        let mut active = ActiveSession {
+            todo: 1,
+            started_at: start,
+            planned_secs: 25 * 60,
+            paused_secs: 0,
+            paused_at: None,
+            max_over_secs: Some(60 * 60),
+            resumed_at: None,
+        };
+        assert_eq!(active.auto_pause_at(), Some(at(85)));
+        assert!(!active.is_paused(at(84)));
+        assert_eq!(format_timer(&active, at(84)), "+59:00");
+
+        // Friday to Monday: the clock stopped an hour into overtime.
+        let monday = at(3 * 24 * 60);
+        assert!(active.is_auto_paused(monday));
+        assert_eq!(format_timer(&active, monday), "⏸ +1:00:00");
+        assert_eq!(active.close_at(monday).end, at(85));
+        assert_eq!(active.ends_at(monday), None);
+
+        // Resuming gives it another hour from then.
+        active.resume(monday);
+        assert!(!active.is_paused(monday));
+        assert_eq!(active.overtime(monday), Duration::hours(1));
+        assert_eq!(active.auto_pause_at(), Some(monday + Duration::hours(1)));
+
+        // Paused by hand, it stays where it was paused.
+        active.pause(monday + Duration::minutes(5));
+        assert!(!active.is_auto_paused(monday + Duration::hours(9)));
+        assert_eq!(
+            active.overtime(monday + Duration::hours(9)),
+            Duration::minutes(65)
+        );
+
+        // Pausing an auto-paused timer pins it where it stopped.
+        let mut idle = ActiveSession {
+            paused_at: None,
+            paused_secs: 0,
+            resumed_at: None,
+            ..active
+        };
+        idle.pause(monday);
+        assert_eq!(idle.paused_at, Some(at(85)));
     }
 }

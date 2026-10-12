@@ -21,7 +21,9 @@ pub use model::{
 };
 pub use parse::{parse_quick_add, QuickAdd};
 pub use store::Store;
-pub use timer::{default_timer, format_countdown, format_duration, format_timer, parse_duration};
+pub use timer::{
+    default_timer, format_countdown, format_duration, format_timer, max_overtime, parse_duration,
+};
 
 #[cfg(test)]
 mod tests {
@@ -599,11 +601,18 @@ mod tests {
         assert_eq!(store.active_timer(), None);
         assert_eq!(store.stop_timer(at(11)), None, "nothing left to stop");
 
-        // A forgotten timer runs on until stopped: nothing closes it.
+        // A forgotten timer pauses itself an hour into overtime.
+        store.set_max_overtime(Some(mins(60)));
         store.start_timer(t.id, mins(25), at(100)).unwrap();
         let late = store.stop_timer(at(100 + 25 + 565)).unwrap();
-        assert_eq!(late.sessions[1].duration(), mins(590));
-        assert_eq!(late.sessions[1].overtime(), Some(mins(565)));
+        assert_eq!(late.sessions[1].duration(), mins(85));
+        assert_eq!(late.sessions[1].overtime(), Some(mins(60)));
+
+        // Without a limit it runs on until stopped.
+        store.set_max_overtime(None);
+        store.start_timer(t.id, mins(25), at(1000)).unwrap();
+        let later = store.stop_timer(at(1000 + 25 + 565)).unwrap();
+        assert_eq!(later.sessions[2].overtime(), Some(mins(565)));
     }
 
     #[test]
@@ -614,7 +623,7 @@ mod tests {
 
         store.start_timer(t.id, mins(25), at(0)).unwrap();
         let paused = store.pause_timer(at(10)).unwrap();
-        assert!(paused.is_paused());
+        assert!(paused.is_paused(at(10)));
         assert_eq!(paused.remaining(at(40)), mins(15), "the clock stands still");
         assert_eq!(
             store.pause_timer(at(20)),
@@ -623,7 +632,7 @@ mod tests {
         );
 
         let resumed = store.resume_timer(at(30)).unwrap();
-        assert!(!resumed.is_paused());
+        assert!(!resumed.is_paused(at(30)));
         assert_eq!(resumed.remaining(at(35)), mins(10));
         assert_eq!(resumed.overtime(at(50)), mins(5));
 
@@ -649,6 +658,7 @@ mod tests {
     fn recorded_sessions_can_be_shortened_deleted_and_added() {
         let path = temp_store_path("edit-sessions");
         let mut store = Store::load(&path).unwrap();
+        store.set_max_overtime(None);
         let t = store.add(NewTodo::default());
         store.start_timer(t.id, mins(25), at(0)).unwrap();
         store.stop_timer(at(590)).unwrap();

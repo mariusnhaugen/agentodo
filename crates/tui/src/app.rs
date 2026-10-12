@@ -534,8 +534,8 @@ impl App {
         let Some(timer) = self.timer else {
             return self.info("no timer running");
         };
-        let pause = pause.unwrap_or(!timer.is_paused());
         let now = self.now();
+        let pause = pause.unwrap_or(!timer.is_paused(now));
         let result = self.repo.with_store(|s| {
             Ok(if pause {
                 s.pause_timer(now)
@@ -545,7 +545,7 @@ impl App {
         });
         self.reload();
         match result {
-            Ok(Some(t)) if t.is_paused() => self.info(format!(
+            Ok(Some(t)) if t.is_paused(now) => self.info(format!(
                 "⏸ paused #{} at {} · P resumes",
                 t.todo,
                 format_duration(t.elapsed(now))
@@ -2719,7 +2719,7 @@ pub(crate) mod tests {
         press(&mut app, "T<CR>");
         app.set_now(t10);
         press(&mut app, "P");
-        assert!(app.timer.unwrap().is_paused());
+        assert!(app.timer.unwrap().is_paused(app.now()));
         assert!(app
             .message
             .as_ref()
@@ -2730,9 +2730,12 @@ pub(crate) mod tests {
         app.set_now(t25);
         assert_eq!(app.tick(), None, "a paused block never runs out");
         press(&mut app, ":pause<CR>");
-        assert!(app.timer.unwrap().is_paused(), ":pause doesn't toggle");
+        assert!(
+            app.timer.unwrap().is_paused(app.now()),
+            ":pause doesn't toggle"
+        );
         press(&mut app, "P");
-        assert!(!app.timer.unwrap().is_paused());
+        assert!(!app.timer.unwrap().is_paused(app.now()));
         assert_eq!(app.running_on(1).num_minutes(), 10);
 
         app.set_now(t90);
@@ -2770,8 +2773,8 @@ pub(crate) mod tests {
 
         app.set_now(t90);
         press(&mut app, "T");
-        assert_eq!(spent(&ts, 1), 90, "overtime is recorded");
-        assert!(app.message.as_ref().unwrap().text.contains("1h5m over"));
+        assert_eq!(spent(&ts, 1), 85, "overtime is recorded, up to the limit");
+        assert!(app.message.as_ref().unwrap().text.contains("1h over"));
     }
 
     #[test]

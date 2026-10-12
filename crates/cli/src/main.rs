@@ -397,7 +397,7 @@ fn duration_arg(s: &str) -> Result<chrono::Duration> {
 }
 
 /// `18:42 left of 25m`, or `+01:12 over 25m` once the block is up, with
-/// `(paused)` while paused.
+/// a note while paused.
 fn timer_state(active: &ActiveSession, now: DateTime<Utc>) -> String {
     let planned = format_duration(active.planned());
     let clock = format_timer(active, now);
@@ -406,7 +406,9 @@ fn timer_state(active: &ActiveSession, now: DateTime<Utc>) -> String {
     } else {
         format!("{clock} left of {planned}")
     };
-    if active.is_paused() {
+    if active.is_auto_paused(now) {
+        format!("{state} (paused itself, left running · agentodo resume or stop)")
+    } else if active.is_paused(now) {
         format!("{state} (paused · agentodo resume)")
     } else {
         state
@@ -464,8 +466,9 @@ fn print_timer(
             "elapsed_secs": active.elapsed(now).num_seconds(),
             "remaining_secs": active.remaining(now).num_seconds(),
             "overtime_secs": active.overtime(now).num_seconds(),
-            "paused": active.is_paused(),
-            "paused_at": active.paused_at,
+            "paused": active.is_paused(now),
+            "auto_paused": active.is_auto_paused(now),
+            "paused_at": active.paused_at.or(active.auto_pause_at().filter(|at| *at <= now)),
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
