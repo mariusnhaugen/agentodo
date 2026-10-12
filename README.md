@@ -4,6 +4,8 @@ A small todo tracker you can drive from the command line or a vim-style TUI, and
 expose to an agent over MCP. The todo logic lives in one core library; the CLI,
 TUI and MCP server are thin adapters over it.
 
+Originally created to have a Todo app/task manager over MCP, but has grown into a TUI with several of my wishlist features that I have started to use to manage my daily workload.
+
 ## Layout
 
 ```
